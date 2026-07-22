@@ -798,12 +798,19 @@ class PairHedgeBot:
             self.client.cancel_order(symbol, oid)
         except Exception as e:
             logger.warning("cancel_order失敗(既に約定/取消済みの可能性): %s", e)
-        try:
-            open_orders = self.client.get_open_orders()
-        except Exception as e:
-            logger.warning("取消後のopenOrders確認に失敗: %s", e)
-            return ("unknown", None)
-        still_open = any(o.get("oid") == oid for o in (open_orders or []))
+        # 取消成功直後でも openOrders に旧注文が残って見える伝播ラグあり(2026-07-22実測:
+        # cancel成功→即時照会で残存ERROR→次tickでは消えていた)。リトライしてから判定する。
+        still_open = True
+        for attempt in range(3):
+            try:
+                open_orders = self.client.get_open_orders()
+            except Exception as e:
+                logger.warning("取消後のopenOrders確認に失敗: %s", e)
+                return ("unknown", None)
+            still_open = any(o.get("oid") == oid for o in (open_orders or []))
+            if not still_open:
+                break
+            time.sleep(0.7)
         if still_open:
             logger.error("取消後もopenOrdersに残存 oid=%s %s -> 手動確認要", oid, symbol)
             self._notify("cancel_race", "red", f"txflow-bot: 取消後もopenOrdersに残存 oid={oid} {symbol}")
