@@ -571,6 +571,8 @@ class PairHedgeBot:
                 _apply_fill(leg, fill, "maker", closing=True)
         self.state = State.UNWIND
 
+    DUST_USD = 5.0  # これ未満のclose残は閉じ直さず次サイクルのreconcileに委ねる
+
     # ------------------------------------------------------------------ UNWIND
     def _verify_leg_flat(self, leg: _Leg, now: float) -> bool:
         """close脚の「閉じ切った」判定を実建玉で裏取りする(2026-07-23)。
@@ -581,6 +583,13 @@ class PairHedgeBot:
         建玉が残っていたらclose状態を巻き戻し、次tickで残量を閉じ直させる。"""
         szi = self._position_szi(leg.symbol)
         if szi is None or abs(szi) < 1e-9:
+            return True
+        # 微小残(notional < DUST_USD)は閉じ直しコスト(taker)の方が高い。次サイクル起動時の
+        # startup_reconcile/stranded処理に委ねて、ここでは完了扱いにする(2026-07-23: szi=-7≒$0.6
+        # のような端数まで巻き戻して無駄なtaker決済を踏んでいた)。
+        px = self._mid(leg.symbol) or 0
+        if px and abs(szi) * px < self.DUST_USD:
+            logger.info("close残 %s szi=%s は微小($%.2f)のため完了扱い", leg.symbol, szi, abs(szi) * px)
             return True
         logger.warning("close完了と判定されたが建玉が残っている %s szi=%s -> 残量を閉じ直す",
                        leg.symbol, szi)
