@@ -37,6 +37,23 @@ lead注文が実際は5回約定していたのにbotは全サイクルを"lead_
    起動時は**symbol不問で全open orderを取消**し、**clearinghouseStateの全建玉**を
    reduce-only IOCでフラット化してWARNING+discord通知する。
 4. wireのp/sの末尾ゼロ除去(Fable実測・修正済み): s="0.0030"だとAuthorization failedになる。
+
+実弾稼働事故2(2026-07-22 20:19-20:21 SOL/ETH)を受けた修正:
+UNWINDでETH close発注のcloid/userFillsどちらでも同定できず"lost"扱いになり、taker強制close
+(`_convert_leg_to_taker`)を試みたが、実ポジションが既にゼロ(何らかの経路で既にフラット
+だった)のためreduce-only注文がエラー応答となり、`close_filled`が立たないままUNWINDから
+50秒以上抜けられなくなった(裸ショートが数分残存)。対策:
+5. **OID_POLL_ATTEMPTS/INTERVALを8回×0.5秒(計4秒)へ延長**(openOrdersの伝播ラグは実測
+   2-3秒あるため、従来の1.5秒(5回×0.3秒)では不足するケースがあった)。
+6. **taker強制close失敗時、実ポジションを直接確認して整合させる**(`_position_szi`)。
+   HTTP例外・レスポンスstatus=="err"のどちらでも、実ポジションが既にゼロなら「既に閉じて
+   いた」とみなしclose_filled=Trueで正常に抜ける(無限リトライ・スタック防止)。ゼロでなければ
+   従来どおり未クローズのまま次のleg_timeoutでの再試行に委ねる。
+7. **watchdog新設**(`_check_watchdog`/`_watchdog_force_reset`): state!=IDLEが
+   `leg_timeout_seconds*2+60`秒を超えて継続したら、両symbolの全open order取消→
+   clearinghouseStateの全建玉をreduce-only IOCでフラット化(リトライ2回)→台帳に
+   abort_reason="watchdog_reset"記録→discord通知(red、1回)→IDLEへ強制リセットする。
+   どの経路が閉塞しても裸ポジションが数分以上残らないようにする恒久安全網。
 """
 
 from __future__ import annotations
@@ -171,7 +188,21 @@ class PairHedgeBot:
 
     # ------------------------------------------------------------------ main loop
     def tick(self) -> None:
-        now = time.time()
+        """トップレベルで例外を捕まえる(2026-07-22事故2対応): 個別メソッド内の想定外例外が
+        tick()から外へ伝播してmain.pyのループごとプロセスを落とす経路を塞ぐ。1tick分の処理を
+        スキップしてログ+通知するだけに留め、状態は次tickでwatchdogが最終的に救済する。"""
+        try:
+            self._tick_inner(time.time())
+        except Exception as e:
+            logger.exception("tick()で予期しない例外、このtickをスキップして継続: %s", e)
+            self._error_streak += 1
+            if self._error_streak >= 3:
+                self._notify("tick_exception", "red", f"txflow-bot: tick()で例外連発: {e}")
+
+    def _tick_inner(self, now: float) -> None:
+        if self._check_watchdog(now):
+            return  # このtickはwatchdogの強制リセットで消費した
+
         if self.halted:
             if not self._was_halted:
                 self._notify("halt", "red", "txflow-bot: 日次損失上限超過でhalt。全close済み。手動確認要")
@@ -192,6 +223,61 @@ class PairHedgeBot:
             self._drive_unwind(now)
         elif self.state == State.FLAT:
             self._finish_cycle(now)
+
+    # ------------------------------------------------------------------ watchdog(指摘3)
+    def _check_watchdog(self, now: float) -> bool:
+        """state!=IDLEが`leg_timeout_seconds*2+60`秒を超えて継続したら強制リセットする
+        恒久安全網。UNWINDでのtaker close失敗など、どの経路が閉塞しても裸ポジションが
+        数分以上残らないようにする(2026-07-22事故2対応)。発火したらTrueを返す
+        (呼び出し側はそのtickの通常処理をスキップする)。"""
+        if self.state == State.IDLE or self._cycle_start_ts is None:
+            return False
+        threshold = float(self.cfg["leg_timeout_seconds"]) * 2 + 60
+        elapsed = now - self._cycle_start_ts
+        if elapsed < threshold:
+            return False
+        logger.error("watchdog発火: state=%s が%.0f秒継続(閾値%.0f秒) -> 強制リセット",
+                     self.state.value, elapsed, threshold)
+        self._notify("watchdog_reset", "red",
+                      f"txflow-bot: watchdog発火。state={self.state.value}が{elapsed:.0f}秒継続、"
+                      f"両symbol全取消+全建玉フラット化して強制リセットします")
+        self._watchdog_force_reset(now)
+        return True
+
+    def _watchdog_force_reset(self, now: float) -> None:
+        if not self.cfg.get("dry_run", True):
+            for symbol in (self.cfg["base_symbol"], self.cfg["hedge_symbol"]):
+                self._cancel_all_orders_for_symbol(symbol)
+            for attempt in range(2):
+                try:
+                    chs = self.client.get_clearinghouse_state()
+                except Exception as e:
+                    logger.error("watchdog: clearinghouseState取得失敗(attempt %d/2): %s", attempt + 1, e)
+                    continue
+                positions = [p["position"] for p in chs.get("assetPositions", [])
+                             if abs(float(p["position"].get("szi", 0))) > 1e-12]
+                if not positions:
+                    break
+                for pos in positions:
+                    symbol = str(pos["coin"]).split("-")[0].upper()
+                    szi = float(pos.get("szi", 0))
+                    is_buy_close = szi < 0
+                    try:
+                        book = self.client.get_l2book(symbol)
+                        levels = book.get("levels", [[], []])
+                        if not levels[0] or not levels[1]:
+                            raise ValueError("l2Book板が空")
+                        bid, ask = float(levels[0][0]["px"]), float(levels[1][0]["px"])
+                    except Exception as e:
+                        logger.error("watchdog: %s のl2Book取得失敗(attempt %d/2): %s", symbol, attempt + 1, e)
+                        continue
+                    price = ask if is_buy_close else bid
+                    try:
+                        self.client.place_limit_order(symbol, is_buy_close, price, abs(szi),
+                                                       reduce_only=True, tif=self.client.TIF_IOC)
+                    except Exception as e:
+                        logger.error("watchdog: %s フラット化失敗(attempt %d/2): %s", symbol, attempt + 1, e)
+        self._abort_cycle_and_log("watchdog_reset", now)
 
     # ------------------------------------------------------------------ stranded leg safety
     def _reconcile_stranded_legs(self) -> None:
@@ -575,21 +661,60 @@ class PairHedgeBot:
                     return
                 if status == "unknown":
                     return
+            resp = None
+            err = None
             try:
-                self.client.place_limit_order(leg.symbol, is_buy, price, leg.target_size,
-                                               reduce_only=not is_open, tif=self.client.TIF_IOC)
+                resp = self.client.place_limit_order(leg.symbol, is_buy, price, leg.target_size,
+                                                       reduce_only=not is_open, tif=self.client.TIF_IOC)
             except Exception as e:
-                logger.error("taker強制close発注失敗 %s: %s", leg.symbol, e)
+                err = e
+            failed = err is not None or not isinstance(resp, dict) or resp.get("status") != "ok"
+            if failed and not is_open:
+                # 指摘2(2026-07-22事故2): close側の失敗(HTTP例外 or status=="err")は
+                # 「実は既にポジションが無かった」ケースがありうる(reduce-only対象なしエラー等)。
+                # ここでclose_filledが立たないまま放置するとUNWINDから永遠に抜けられなくなる
+                # (実測: 50秒以上スタック)。実ポジションを直接確認し、既にゼロなら
+                # 「既に閉じていた」とみなして正常にclose_filledを立てて抜ける。
+                szi = self._position_szi(leg.symbol)
+                if szi is not None and abs(szi) < 1e-9:
+                    logger.warning("taker close失敗(%s)だが実ポジションは既にゼロ %s -> close済みとして扱う",
+                                    err if err else resp.get("response"), leg.symbol)
+                    fill = {"px": price, "sz": 0.0, "fee": 0.0}
+                    _apply_fill(leg, fill, "taker", closing=True)
+                    return
+            if failed:
+                detail = err if err else (resp.get("response") if isinstance(resp, dict) else resp)
+                logger.error("taker強制close発注失敗 %s: %s", leg.symbol, detail)
                 self._notify("taker_force_close_failed", "red",
-                              f"txflow-bot: taker強制close失敗 {leg.symbol}: {e}。手動対応要")
+                              f"txflow-bot: taker強制close失敗 {leg.symbol}: {detail}。手動対応要")
                 return  # legは更新しない(次tickで再試行される)
 
         fill = {"px": price, "sz": leg.target_size, "fee": _fee(leg.notional(price), is_maker=False)}
         _apply_fill(leg, fill, "taker", closing=not is_open)
 
+    def _position_szi(self, symbol: str) -> Optional[float]:
+        """指摘2: clearinghouseStateから実ポジションのszi(符号付きサイズ)を直接確認する。
+        取得失敗時はNone(=判定不能、呼び出し側は安全側=既存の未クローズ扱いを維持すること)。"""
+        try:
+            chs = self.client.get_clearinghouse_state()
+        except Exception as e:
+            logger.warning("ポジション確認失敗(clearinghouseState) %s: %s", symbol, e)
+            return None
+        positions = {str(p["position"]["coin"]).split("-")[0].upper(): p["position"]
+                     for p in chs.get("assetPositions", [])}
+        pos = positions.get(symbol.upper())
+        if not pos:
+            return 0.0
+        try:
+            return float(pos.get("szi", 0))
+        except (TypeError, ValueError):
+            return None
+
     # ------------------------------------------------------------------ live-mode helpers
-    OID_POLL_ATTEMPTS = 5
-    OID_POLL_INTERVAL_SEC = 0.3
+    # 2026-07-22事故2: openOrdersの伝播ラグは実測2-3秒あり、従来1.5秒(5回×0.3秒)では
+    # 不足するケースがあった。8回×0.5秒(計4秒)へ延長。
+    OID_POLL_ATTEMPTS = 8
+    OID_POLL_INTERVAL_SEC = 0.5
 
     def _place_and_identify(self, symbol: str, is_buy: bool, price: float, size: float,
                              reduce_only: bool = False) -> tuple[str, Optional[int], Optional[dict]]:

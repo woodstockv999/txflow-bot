@@ -29,6 +29,8 @@ class FakeClient:
         self._next_oid = 1000
         self.clearinghouse_state = {"assetPositions": []}
         self.books = {}
+        self.place_status = "ok"  # テストから"err"に切り替えてfailure経路を再現する
+        self.place_err_message = "mock error"
 
     def new_cloid(self) -> str:
         import uuid
@@ -46,6 +48,16 @@ class FakeClient:
         self._next_oid += 1
         self.placed.append({"symbol": symbol, "is_buy": is_buy, "price": price, "size": size,
                              "reduce_only": reduce_only, "tif": tif, "cloid": cloid, "oid": oid})
+        status = getattr(self, "place_status", "ok")
+        if status != "ok":
+            return {"status": "err", "response": getattr(self, "place_err_message", "mock error")}
+        if reduce_only:
+            # reduce-only成功をclearinghouse_stateに反映する(watchdog等のretry-until-flatが
+            # 現実的に収束することをテストできるようにする簡易シミュレーション)。
+            positions = self.clearinghouse_state.get("assetPositions", [])
+            self.clearinghouse_state["assetPositions"] = [
+                p for p in positions if str(p["position"]["coin"]).split("-")[0].upper() != symbol.upper()
+            ]
         return {"status": "ok"}
 
     def get_open_orders(self):
@@ -252,6 +264,133 @@ def test_dry_run_cycle_runs_without_network():
         _time.sleep(0.01)
     assert bot.cycle_count >= 1
     assert bot.state in (State.IDLE, State.LEAD_RESTING)
+
+
+# ------------------------------------------------------------------ 指摘2(事故2): taker close失敗時のポジション確認
+def test_convert_leg_to_taker_close_err_response_but_position_flat_still_progresses():
+    """taker強制closeの応答がstatus=="err"でも、実ポジションが既にゼロなら
+    close_filled=Trueで正常に抜けること(2026-07-22事故2: ここが立たずUNWINDに50秒以上
+    スタックした)。"""
+    bot = _bot()
+    bot.client.place_status = "err"
+    bot.client.place_err_message = "mock: nothing to reduce"
+    bot.client.clearinghouse_state = {"assetPositions": []}  # 実ポジションは既にゼロ
+
+    leg = _Leg(symbol="ETH", is_buy_open=True, target_size=0.5)
+    leg.close_oid = None  # oid不明(lost経由を模す)
+    bot._convert_leg_to_taker(leg, bid=1900.0, ask=1900.5, phase="close")
+
+    assert leg.close_filled is True
+    assert leg.close_type == "taker"
+    assert leg.close_price is not None
+
+
+def test_convert_leg_to_taker_close_err_response_and_position_still_open_does_not_mark_filled():
+    """比較対照: 応答がerrで実ポジションもまだ残っている場合はclose_filledを立てず、
+    次tickの通常timeout経路での再試行に委ねること(=無限フォールス成功を防ぐ)。"""
+    bot = _bot()
+    bot.client.place_status = "err"
+    bot.client.clearinghouse_state = {
+        "assetPositions": [{"position": {"coin": "ETH-USDC", "szi": "0.5"}}]
+    }
+    leg = _Leg(symbol="ETH", is_buy_open=True, target_size=0.5)
+    leg.close_oid = None
+    bot._convert_leg_to_taker(leg, bid=1900.0, ask=1900.5, phase="close")
+
+    assert leg.close_filled is False
+    assert len(bot._notifications) == 1
+    assert bot._notifications[0][0] == "taker_force_close_failed"
+
+
+def test_unwind_lost_identification_proceeds_via_taker_close_to_next_cycle(monkeypatch):
+    """UNWINDでclose発注のcloid/userFills同定が"lost"でも、taker強制closeが成功応答なら
+    close_filledが立ち、両脚揃えばFLAT->IDLEまで進んで次サイクルに進めること。"""
+    monkeypatch.setattr("src.hedge_bot.time.sleep", lambda *_: None)
+    ws = FakeWS(books={"BTC": (65000.0, 65000.0), "ETH": (1900.0, 1900.0)})
+    bot = _bot(ws=ws)  # dry_run=False(既定)
+
+    lead = _Leg(symbol="BTC", is_buy_open=True, target_size=0.001)
+    lead.open_filled = True
+    lead.open_price = 65000.0
+    lead.open_fee = 0.01
+    hedge = _Leg(symbol="ETH", is_buy_open=False, target_size=0.02)
+    hedge.open_filled = True
+    hedge.open_price = 1900.0
+    hedge.open_fee = 0.01
+    bot.legs = {"BTC": lead, "ETH": hedge}
+    bot._cycle_start_ts = _time.time()
+    bot.state = State.HOLD
+    bot._hold_until = _time.time() - 1  # 即unwindへ
+
+    # openOrders/userFillsは常に空 -> _place_and_identifyは両脚とも"lost"になる
+    bot.client.open_orders = []
+    bot.client.fills = []
+
+    bot.tick()  # HOLD -> _start_unwind (両脚"lost"->taker強制close->close_filled=True) -> UNWIND
+    assert lead.close_filled is True
+    assert hedge.close_filled is True
+
+    bot.tick()  # UNWIND -> all_closed=True -> FLAT
+    bot.tick()  # FLAT -> _finish_cycle -> IDLE, cycle_count+1
+
+    assert bot.state == State.IDLE
+    assert bot.cycle_count == 1
+
+
+# ------------------------------------------------------------------ 指摘3: watchdog
+def test_watchdog_fires_when_state_stuck_beyond_threshold():
+    bot = _bot(cfg_overrides={"leg_timeout_seconds": 10})  # 閾値 = 10*2+60 = 80秒
+    bot.client.open_orders = [{"coin": "BTC-USDC", "oid": 1}, {"coin": "ETH-USDC", "oid": 2}]
+    bot.client.clearinghouse_state = {
+        "assetPositions": [{"position": {"coin": "ETH", "szi": "-0.42"}}]
+    }
+    bot.client.books["ETH"] = {"levels": [[{"px": "1900.0"}], [{"px": "1900.5"}]]}
+
+    bot.state = State.UNWIND
+    bot.legs = {"BTC": _Leg(symbol="BTC", is_buy_open=True, target_size=0.001)}
+    bot._cycle_start_ts = _time.time() - 100  # 閾値80秒を超過
+
+    fired = bot._check_watchdog(_time.time())
+
+    assert fired is True
+    assert bot.state == State.IDLE
+    assert bot.legs == {}
+    assert sorted(bot.client.canceled_oids) == [1, 2]  # 両symbol分の全取消
+    # ETHの残ポジション(-0.42、ショート)を買い戻すreduce-only IOC発注が出ていること
+    flatten_orders = [o for o in bot.client.placed if o["symbol"] == "ETH"]
+    assert len(flatten_orders) == 1
+    assert flatten_orders[0]["is_buy"] is True
+    assert flatten_orders[0]["reduce_only"] is True
+    assert flatten_orders[0]["tif"] == bot.client.TIF_IOC
+    assert any(n[0] == "watchdog_reset" for n in bot._notifications)
+
+
+def test_watchdog_does_not_fire_before_threshold():
+    bot = _bot(cfg_overrides={"leg_timeout_seconds": 60})  # 閾値180秒
+    bot.state = State.HEDGED
+    bot._cycle_start_ts = _time.time() - 10
+    assert bot._check_watchdog(_time.time()) is False
+    assert bot.state == State.HEDGED
+
+
+def test_watchdog_ignored_while_idle():
+    bot = _bot()
+    bot.state = State.IDLE
+    bot._cycle_start_ts = _time.time() - 10000
+    assert bot._check_watchdog(_time.time()) is False
+
+
+def test_tick_catches_unexpected_exception_without_crashing(monkeypatch):
+    """tick()内の想定外例外がプロセスを落とさずログ+継続すること(事故2で懸念された
+    「未捕捉例外でmain.pyのループごと落ちてログが完全に止まる」経路の防止)。"""
+    bot = _bot(cfg_overrides={"dry_run": True})
+
+    def boom(now):
+        raise RuntimeError("boom")
+
+    bot._tick_inner = boom
+    bot.tick()  # 例外を投げずに戻ってくること
+    assert bot._error_streak >= 1
 
 
 if __name__ == "__main__":
