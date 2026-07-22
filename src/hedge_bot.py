@@ -785,7 +785,7 @@ class PairHedgeBot:
                         logger.info("taker close不要 %s: 実建玉が既にゼロ -> close済みとして扱う", leg.symbol)
                         _apply_fill(leg, {"px": price, "sz": 0.0, "fee": 0.0}, "taker", closing=True)
                         return
-                    size = min(size, abs(szi))
+                    size = abs(szi)  # 閉じ残り(stranded leg)を作らないため実建玉を正とする
 
             resp = None
             err = None
@@ -959,14 +959,19 @@ class PairHedgeBot:
         return "lost", None, None
 
     def _clamp_size_to_position(self, symbol: str, size: float) -> Optional[float]:
-        """reduce-only発注のサイズを実建玉以下に収める。close側の部分約定はtarget_sizeに
-        反映されない(=_apply_fillのサイズ更新はopen側のみ)ため、建玉が目標より小さくなると
-        "New order will increase your position"で拒否され、unwindがtaker強制closeへ落ちていた
-        (2026-07-23実測)。取得失敗時はNoneでなく元サイズを返す(安全側=従来動作)。"""
+        """reduce-only発注のサイズを「実建玉そのもの」にする(2026-07-23)。
+
+        target_size基準で閉じると2方向に壊れる:
+          (1) 建玉 < target → "New order will increase your position"で拒否されtaker強制closeへ
+          (2) 建玉 > target → 閉じ残りがstranded legとしてサイクル外に残り、
+              別途takerで処理される。この分は台帳のnet_pnlに載らないため
+              「台帳では効率4,648・実約定では1,355」という乖離を生んでいた。
+        取消×約定レースの取りこぼしがある限りtarget_sizeは信用できないので、
+        実建玉(clearinghouseStateのszi)を正とする。取得失敗時のみ元サイズ(安全側)。"""
         szi = self._position_szi(symbol)
         if szi is None:
             return size
-        return min(size, abs(szi))
+        return abs(szi)
 
     def _clamp_price_to_passive(self, symbol: str, is_buy: bool, price: float) -> float:
         """post_onlyがクロスして棄却されないよう、直近のRESTの板で価格をパッシブ側へ寄せる。
