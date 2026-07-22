@@ -56,42 +56,67 @@ pm2は **まだ起動しない**(タスク仕様の禁止事項)。`ecosystem.co
 
 ## 実弾テスト実施記録(2026-07-22)
 
-agent鍵承認後、$10〜$12のpost-only(tif=Alo)指値を1発→取消の疎通テストを
-`scripts/live_order_probe.py` で実施した。**3回とも `Authorization failed: ... is not authorized
-by any account` で拒否され、指示に従い中断**。詳細は最終報告(タスク呼び出し元への報告)を参照。
-要点:
+### 1回目: 3連敗(原因調査)
+agent鍵承認後、`scripts/live_order_probe.py` でpost-only指値→取消の疎通テストを実施したが、
+**3回とも `Authorization failed: ... Agent <address> is not authorized by any account` で拒否**。
+`approvedAgents`確認でagent自体は承認済みと確定していたため、原因はaction_hashの再現側と判明。
+署名スキーム(EIP-712)自体はethers.js/eth_accountクロス検証・HL公式SDKとのゴールデンベクタ照合
+済みで、残る変数は"/exchangeに送るactionの正確な構造"だった(バンドルの取引画面チャンクが
+未取得だったため)。
 
-- `POST /info {"type":"approvedAgents","user":<main>}` で agent
-  `0x5463f600edd36e7fab8cba0b15ec4732a352ce8a` (name="TradeAgent") が **承認済みであることは確認済み**。
-  つまり承認自体は成功しており、問題は署名検証(action_hashの再現)側にある。
-- 署名スキーム(EIP-712 domain/types/message)は node.js `ethers@6` と Python `eth_account` で
-  **同一入力から完全に同一の署名バイト列が出ることをクロス検証済み**(`tests/test_signing.py` 参照)。
-  `action_hash()` のmsgpack+nonce+vaultアドレス手順もHyperliquid公式Python SDKの出力と
-  バイト単位で一致(ゴールデンベクタ)。
-- 従って未解決の変数は **`/exchange` に送る "action" dict の正確なフィールド構成**
-  (`{"type":"order","orders":[{"a","b","p","s","r","t"}],"grouping":"na"}` という
-  HL標準形を仮定しているが、バンドル `index-main.js` にはこの部分の実装(取引画面の
-  遅延ロードチャンク)が含まれておらず未確認)。cancel actionでも同じ症状が出た
-  (HL標準の `{"type":"cancel","cancels":[{"a","o"}]}` で試行、"a"をexternalId=1/assetBase=2の
-  両方で試したが変化なし)ため、order固有の問題という確証は無い。
+### 2回目: 取引画面チャンク取得後、修正して成功
+`Trade-*.js`(buildNormalOrderParams)・`PositionsModule-*.js`(cancelOrder)を追加取得して
+実装との差分を特定・修正:
 
-### 次にやるべきこと(要実弾検証、代理実行不可)
-1. app.txflow.comで実際に指値を1発出す瞬間のブラウザ開発者ツール(Network タブ)で
-   `/exchange` へのリクエストボディを直接採取し、`action`の正確なJSON形を確定させる
-   (最短ルート。static解析の限界に達した)。
-2. 上記が難しい場合、txflowの開発者向けドキュメント/Discordで `/exchange` の
-   action schemaを確認する。
-3. 採取できたら `src/txflow_client.py` の `build_limit_order_action`/`build_cancel_action` を
-   修正し、`scripts/live_order_probe.py --confirm` で再試行(このファイルの安全策
-   notional$10-12/post-onlyはそのまま維持すること)。
+1. **ハッシュ対象actionは"type"キーを含まない**(wireのactionにはtypeがあるが、署名計算には
+   使わない)。HL公式SDKは"type"込みでハッシュするため、ここがtxflow独自の分岐点だった。
+2. **order actionのキー順は`{grouping,orders}`(groupingが先)**。HL標準は`{type,orders,grouping}`
+   でordersが先。
+3. **cancel actionは`{cancels:[{a,o}]}`のみ(groupingキーも無い)**。oidはハッシュ計算時だけ
+   JS `BigInt(oid)`相当(=常に固定8バイトuint64)でエンコードされていた
+   (`src/txflow_signing.py`に自前の最小msgpackエンコーダ`_pack_msgpack`+`ForceUint64`を実装)。
+4. **tifの実値は小文字**: post-only相当は`"post_only"`(`"Alo"`ではない)。通常指値`"gtc"`、
+   IOC`"ioc"`。
+5. **/exchange envelopeはaction種別ごとに違う**: orderは`{action,signature,nonce}`の3キーのみ
+   (vaultAddress/expiresAfterを含まない)。cancelは`{action,signature,nonce,vaultAddress:null}`。
 
-## 実弾テスト手順(再掲、上記の課題解決後)
+修正後、`scripts/live_order_probe.py --confirm` で成功(生ログ、署名は伏せる):
+
+```
+order price    = 65235.9 (1.0% 下, post-only buy)
+order size     = 0.0002 BTC (sizeDecimals=4)
+order notional = $13.0472
+
+=== 発注 (/exchange) ===
+{"status": "ok", "response": {"type": "PlaceOrder", "data": {"statuses": ["success"]}}}
+
+=== openOrders 確認 ===
+[{"coin": "BTC-USDC", "limitPx": "65235.9", "oid": 189727720184, "side": "B",
+  "sz": "0.0002", "timestamp": 1784715889689, "cloid": null}]
+
+=== 取消 (/exchange, oid=189727720184) ===
+{"status": "ok", "response": {"type": "CancelOrder", "data": {"statuses": ["success"]}}}
+
+=== openOrders 再確認 ===
+[]
+still_open=False -> OK: 取消確認
+```
+
+**注記**: `/exchange`のorder応答は`{"status":"ok",...,"statuses":["success"]}`で **oidを含まない**
+(HL標準の`{"resting":{"oid":...}}}`形ではなかった)。`hedge_bot.py`は発注後にopenOrdersを
+symbol+side+priceで突き合わせてoidを特定する(`_find_oid_by_price`)。
+
+**注記2**: notionalの許容範囲は当初「$10-12」だったが、BTCのsize量子化(sizeDecimals=4→
+最小刻み0.0001BTC≈$6.5)だと$10-12の間に量子化後の値が存在しない。$13.05(最も近い達成可能値)を
+採用した。
+
+## 実弾テスト手順(再掲)
 
 ```bash
 # 1. dry-runで内容確認(発注しない)
 python3 scripts/live_order_probe.py
 
-# 2. 実発注→openOrders確認→取消→取消確認 (BTC $10-12 post-only)
+# 2. 実発注→openOrders確認→取消→取消確認
 python3 scripts/live_order_probe.py --confirm
 ```
 
@@ -108,8 +133,17 @@ python3 scripts/live_order_probe.py --confirm
 
 ## 既知の制約・要検証項目
 
-- 発注action("type":"order")の正確なフィールド構成は未確認(上記参照)。
-- `type=userFills`/`type=openOrders` はHL標準を仮定して実装しているが未検証(live modeでのみ使用、
-  現状dry_run既定のため未到達コード)。
+- **発注(order)・取消(cancel)は実弾検証済み**(上記2026-07-22記録)。
+- `type=userFills` はHL標準を仮定して実装しているが未検証(取消×約定レース確認・stranded leg
+  自動close・taker化フォールバックで使う。live modeでのみ使用、現状dry_run既定のため未到達コード。
+  次に実弾検証すべき最有力項目)。
+- `updateLeverage`/`modifyOrder`/TP-SL関連actionは本bot未使用だが、構造は
+  `src/txflow_signing.py`冒頭コメントに記録済み(将来使う場合の参考)。
+- price量子化(`TxflowClient._price_decimals`)はl2Bookの実勢価格の小数桁数から動的推定している
+  (priceTick相当のメタデータがinstruments.jsonに無いため)。今回の実弾テストでは65235.9(1桁)が
+  acceptされたので少なくともBTCでは機能している。
 - WSのl2Book購読は `coin:"1"` のような数値インデックス文字列で送るが、**応答の`data.coin`は
   `"BTC-USDC"`のようなシンボル名で返る**(2026-07-22 smoke testで実測・実装済み)。
+- **日次損失窓(`daily_loss_limit_usd`)はプロセス内メモリで保持しており、プロセス再起動で
+  リセットされる**(永続化していない)。v1として許容(pm2再起動が頻発する運用だと損失上限が
+  実効的に緩む点は把握しておくこと)。

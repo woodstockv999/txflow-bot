@@ -19,11 +19,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.txflow_signing import (
     DEFAULT_NETWORK,
+    ForceUint64,
     NonceManager,
     action_hash,
     build_approve_agent_typed_data,
     recover_agent_address,
     sign_l1_action,
+    wire_action_for_hash,
 )
 
 ORDER_ACTION = {
@@ -111,6 +113,45 @@ def test_build_approve_agent_typed_data_uses_signature_chain_id_for_domain():
     assert payload["primaryType"] == "ApproveAgent"
     assert payload["message"]["agentName"] == "TradeAgent"
     assert payload["message"]["nonce"] == 123
+
+
+def test_wire_action_for_hash_strips_type_preserves_key_order():
+    # 2026-07-22実測(Trade.js buildNormalOrderParams / PositionsModule.js cancelOrder):
+    # ハッシュ対象はwire actionから"type"だけ除いたもの。残りのキー順はwireのまま。
+    wire = {"type": "order", "grouping": "na", "orders": [1, 2]}
+    hashed = wire_action_for_hash(wire)
+    assert hashed == {"grouping": "na", "orders": [1, 2]}
+    assert list(hashed.keys()) == ["grouping", "orders"]
+
+
+def test_force_uint64_always_encodes_as_fixed_8_bytes():
+    from src.txflow_signing import _pack_msgpack
+
+    packed = _pack_msgpack(ForceUint64(5))
+    assert packed == b"\xcf" + (5).to_bytes(8, "big")
+    assert len(packed) == 9
+    # 通常のintなら5はpositive fixint(1バイト)になる、という対比
+    assert _pack_msgpack(5) == b"\x05"
+
+
+def test_cancel_hash_with_force_uint64_oid_differs_from_plain_int_oid():
+    # 実測(PositionsModule.js): cancelのoidはハッシュ計算時だけBigInt(y)でラップされる。
+    # ForceUint64を使わないと通常のcompact int encodingになりハッシュが変わってしまう。
+    plain = action_hash({"cancels": [{"a": 1, "o": 5}]}, None, 1)
+    forced = action_hash({"cancels": [{"a": 1, "o": ForceUint64(5)}]}, None, 1)
+    assert plain != forced
+
+
+def test_order_action_hash_matches_grouping_before_orders_no_type():
+    # 2026-07-22実測どおりのaction({grouping,orders}、typeなし)でも action_hash が
+    # 正常に(例外なく)計算できることの確認。HL標準({type,orders,grouping})とは
+    # 異なるバイト列になる(=別ハッシュ)ことも合わせて確認。
+    txflow_style = {"grouping": "na", "orders": [{"a": 1, "b": True, "p": "1", "s": "1",
+                                                    "r": False, "t": {"limit": {"tif": "post_only"}}}]}
+    hl_style = {"type": "order", "orders": txflow_style["orders"], "grouping": "na"}
+    h1 = action_hash(txflow_style, None, 1)
+    h2 = action_hash(hl_style, None, 1)
+    assert h1 != h2
 
 
 if __name__ == "__main__":

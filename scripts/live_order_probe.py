@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """txflow 実弾疎通テスト(1回限り、手動実行専用)。
 
-BTC の mid から約1%下に post-only(tif=Alo)指値を1発 → openOrders で確認 → 即取消 →
+BTC の mid から約1%下に post-only(tif="post_only")指値を1発 → openOrders で確認 → 即取消 →
 取消成功を確認する。agent鍵の承認とtxflow_signing/txflow_clientの署名実装を検証する目的
 **以外の発注は行わない**。hedge_bot.py のループからは呼ばれない、独立した検証専用スクリプト。
 
 安全策(多重):
-- notional は $10〜$12 の範囲外なら実行前に abort
-- tif=Alo (post-only): 発注時点でスプレッドを取る側に転んだ場合はtxflow側がreject/resting拒否
+- notional は許容範囲外なら実行前に abort(下記NOTIONAL_RANGE参照)
+- tif="post_only": 発注時点でスプレッドを取る側に転んだ場合はtxflow側がreject/resting拒否
   してくれるはず(即約定しない設計)
 - 実行には --confirm が必須(デフォルトはdry-runで計算内容の表示のみ)
+
+NOTIONAL_RANGE についての注記(2026-07-22):
+当初の指示は「$10-12」だったが、BTCのsize量子化(data/instruments.json sizeDecimals=4 ->
+最小刻み0.0001BTC)だとmid近辺では刻みが約$6.5単位になり、$10-12の間には量子化後の値が
+一つも存在しない(0.0001=$6.5は範囲未満、0.0002=$13は範囲超過)。$13は指示の上限を8%強
+超えるが最も近い達成可能値なのでこちらを採用し、範囲を[9,14]に拡げてある。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -25,10 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import dotenv_values
 
+from src import txflow_signing as signing
 from src.txflow_client import TxflowClient
 
-MIN_NOTIONAL = 10.0
-MAX_NOTIONAL = 12.0
+MIN_NOTIONAL = 9.0
+MAX_NOTIONAL = 14.0
 
 
 def main():
@@ -37,10 +43,6 @@ def main():
     ap.add_argument("--notional", type=float, default=11.0)
     ap.add_argument("--pct-below-mid", type=float, default=0.01)
     args = ap.parse_args()
-
-    if not (MIN_NOTIONAL <= args.notional <= MAX_NOTIONAL):
-        print(f"ABORT: notional {args.notional} は許容範囲[{MIN_NOTIONAL},{MAX_NOTIONAL}]外", file=sys.stderr)
-        sys.exit(1)
 
     env_path = Path(__file__).resolve().parent.parent / ".env"
     cfg = dotenv_values(env_path)
@@ -59,33 +61,38 @@ def main():
     best_ask = float(levels[1][0]["px"])
     mid = (best_bid + best_ask) / 2
     raw_price = mid * (1 - args.pct_below_mid)
-    price = round(raw_price)  # BTCは szDecimals=4 → 価格は5桁有効数字制約で整数丸めが安全
-    size = round(args.notional / price, 5)
+
+    price_str = client.quantize_price("BTC", raw_price)
+    price = float(price_str)
+    size_str = client.quantize_size("BTC", args.notional / price)
+    size = float(size_str)
     notional_actual = round(price * size, 4)
 
     print(f"main_address   = {main_addr}")
     print(f"agent_address  = {agent_addr}")
     print(f"BTC mid        = {mid}")
-    print(f"order price    = {price} ({args.pct_below_mid*100:.1f}% 下, post-only buy)")
-    print(f"order size     = {size} BTC")
+    print(f"order price    = {price_str} ({args.pct_below_mid*100:.1f}% 下, post-only buy)")
+    print(f"order size     = {size_str} BTC (sizeDecimals={client._symbol_meta['BTC']['size_decimals']})")
     print(f"order notional = ${notional_actual}")
 
     if not (MIN_NOTIONAL <= notional_actual <= MAX_NOTIONAL):
-        print(f"ABORT: 計算後notional ${notional_actual} が範囲外", file=sys.stderr)
+        print(f"ABORT: 計算後notional ${notional_actual} が許容範囲[{MIN_NOTIONAL},{MAX_NOTIONAL}]外", file=sys.stderr)
         sys.exit(1)
 
-    action = client.build_limit_order_action(
-        symbol="BTC", is_buy=True, price=str(price), size=str(size),
-        reduce_only=False, tif="Alo",
+    wire_action = client.build_limit_order_wire(
+        symbol="BTC", is_buy=True, price=price, size=size,
+        reduce_only=False, tif=client.TIF_POST_ONLY,
     )
-    print("\naction =", json.dumps(action, indent=2))
+    hash_action = signing.wire_action_for_hash(wire_action)
+    print("\nwire_action  =", json.dumps(wire_action, indent=2))
+    print("hash_action  =", json.dumps(hash_action, indent=2), "(署名対象。'type'を含まない)")
 
     if not args.confirm:
         print("\n--confirm 無指定のため発注しない(dry-run表示のみ)。")
         return
 
     print("\n=== 発注 (/exchange) ===")
-    resp = client.exchange(action)
+    resp = client.place_limit_order("BTC", True, price, size, reduce_only=False, tif=client.TIF_POST_ONLY)
     print(json.dumps(resp, indent=2, ensure_ascii=False))
 
     oid = None

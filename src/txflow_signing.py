@@ -34,12 +34,56 @@
   メインウォレットの実署名(MetaMask等)で行う。types/domain/messageは
   `build_approve_agent_typed_data()` にそのまま転記。
 
-## 未確認・要注意
-- `placeLimitOrder` の action JSON の中身( `a/b/p/s/r/t` フィールド名・`grouping:"na"` 等)は
-  このバンドル(エントリーチャンクのみ)には含まれておらず、取引画面の遅延ロードチャンクに
-  あると見られる。txflowは"Hyperliquid完全フォーク"と明言されているため、HL公式SDKの
-  `OrderWire`/`order_wires_to_order_action` と同一のフィールド名・構造であると仮定して実装した
-  (`txflow_client.py` 側)。実弾テスト($10 BTC指値1発)で最初に確認すべき最重要項目。
+## 2026-07-22 追記: 取引画面チャンク(Trade.js / PositionsModule.js)実測で確定した事実
+実弾プローブが "Agent X is not authorized" (=署名から復元されるアドレスが違う=ハッシュ対象の
+action構築が間違っている) で3連敗した後、遅延チャンクを取得して原因を特定した。
+
+1. **ハッシュ対象の action は "type" キーを含まない**。wireで送る action には type がある
+   (例: `{type:"order",grouping:"na",orders:[...]}`) が、署名(=action_hash)の入力に使う
+   dict は type を除いたもの(`{grouping:"na",orders:[...]}`)。cancel/updateLeverageでも
+   同様(下記3参照)。HL公式SDKは type を含めてハッシュするため、ここがtxflow独自の分岐点。
+   → `wire_action_for_hash()` で "type" だけ取り除く。
+2. **order actionのキー順は `{grouping, orders}`(groupingが先)**。HL公式SDKは
+   `{type,orders,grouping}`(ordersが先)なので、type除去後も残り2キーの順序が違うと
+   msgpackのバイト列が変わりハッシュが変わる。実測(Trade.js `fo`関数、buildNormalOrderParams):
+   ```js
+   const p = {grouping:"na", orders:l};              // ← ハッシュ対象(type無し、grouping先)
+   const {signature:g, nonce:v} = await n(e, p, !0);
+   return {action:{type:"order", grouping:"na", orders:l}, signature:..., nonce:v};
+   // ↑ wireに送るactionだけtypeを足す(順序は type,grouping,orders)
+   ```
+   order wire本体(`t:{limit:{tif}}`まで含む1件)のキー順は `{a,b,p,s,r,t}` でHLと同一
+   (`i=(a,c)=>({a:t,b:a.orderSide==="buy",p:a.price,s:c,r:a.reduceOnly,t:{limit:{tif:a.timeInForce}}})`)。
+3. **cancel actionのハッシュ対象は `{cancels:[{a,o}]}`(typeも無ければgroupingキーも無い、
+   通常キャンセルの場合)**。実測(PositionsModule.js `cancelOrder`フック):
+   ```js
+   const C = {cancels:[{...w?{grouping:w}:{}, a:T, o:BigInt(y)}]};  // wは通常キャンセルではundefined
+   const {signature:_, nonce:L} = await u(n, C, !0);
+   const v = {action:{type:"cancel", cancels:[{...w?{grouping:w}:{}, a:T, o:y}]},
+              signature:..., nonce:L, vaultAddress:null};
+   ```
+   **oidはハッシュ対象では`BigInt(y)`、wireでは素の数値`y`**。@msgpack/msgpackはBigInt入力を
+   常に固定8バイト(uint64, 0xcf)でエンコードすると見られ、標準msgpackパッケージの可変長圧縮とは
+   異なりうるため、本ファイルはmsgpackパッケージを使わず自前の最小エンコーダ`_pack_msgpack()`で
+   ハッシュを組み立て、oidだけ`ForceUint64`でマークして固定8バイトにする(下記参照)。
+   TP/SL関連のキャンセルは `grouping:"tpsl"` がハッシュ対象にも入る変種があるが本bot未使用。
+4. **updateLeverageのハッシュ対象は `{asset,leverage,marginMode}`(typeなし)、wireは
+   `{type:"updateLeverage",...d}` + 別に `isFrontend:true,vaultAddress:null` を envelope に
+   追加**(PositionsModule.js `sb`フック)。本bot未使用だが将来の罠として記録。
+5. **closeAll(全ポジション成行決済)の order wireには `m:<symbol小文字>` という追加フィールドが
+   付き、wireのactionには`nonce`も同梱される変種がある**(`xP`フック)。本bot未使用。
+6. **/exchange envelopeはaction種別ごとに構成キーが違う(実測)**:
+   - order: `{action, signature, nonce}` の3キーのみ。**vaultAddress/expiresAfterを含まない**。
+   - cancel: `{action, signature, nonce, vaultAddress:null}` の4キー。expiresAfterは無い。
+   - updateLeverage: `{action, isFrontend:true, vaultAddress:null, signature, nonce}`。
+   → `txflow_client.py` はaction種別ごとに正確にこの形で送る。
+7. **tif(timeInForce)の実際の文字列値は小文字**: UIの`time_in_force_options`実測で
+   `[{key:"GTC",value:"gtc"}, {key:"POST_ONLY",value:"post_only"}, {key:"IOC",value:"ioc"}]`
+   ("Gtc"/"Alo"/"Ioc"というHL標準の大文字camelは使われていない)。フォームのdefaultValueは
+   指値注文で`"gtc"`、成行(market)注文は`"FrontendMarket"`という別の特殊値。
+   **post-only相当は `"post_only"`**(注文履歴の表示側では`tif==="ALO"`をPost Onlyと表示して
+   いるため、サーバ内部では"ALO"に正規化される可能性はあるが、送信時のリクエストボディは
+   "post_only"が実測値)。
 """
 
 from __future__ import annotations
@@ -48,7 +92,6 @@ import re
 import time
 from typing import Any, Optional
 
-import msgpack
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 from eth_utils import keccak, to_hex
@@ -101,11 +144,110 @@ def address_to_bytes(address: str) -> bytes:
     return bytes.fromhex(address[2:] if address.startswith("0x") else address)
 
 
+class ForceUint64(int):
+    """oidなど、txflowフロントがmsgpackハッシュ計算時だけJS BigInt(...)でラップして常に
+    固定8バイト(uint64, 0xcf)でエンコードするフィールド用のマーカー型(このファイル冒頭の
+    2026-07-22追記の3参照)。使い方: `{"a":1, "o":ForceUint64(12345)}` のように該当フィールド
+    だけラップして action_hash() に渡す。intのサブクラスなので通常のint演算はそのまま使える。
+    """
+
+    __slots__ = ()
+
+
+def wire_action_for_hash(wire_action: dict) -> dict:
+    """/exchangeに送るwire actionから、署名対象(msgpackハッシュ)に使う dict を作る。
+    実測(このファイル冒頭2026-07-22追記の1参照): txflowは "type" キーだけを除いたものを
+    ハッシュする。残りのキーの順序はwireのまま(dict内包表記はPython 3.7+で挿入順を保つ)。
+    """
+    return {k: v for k, v in wire_action.items() if k != "type"}
+
+
+def _pack_int(i: int) -> bytes:
+    if 0 <= i <= 0x7F:
+        return bytes([i])
+    if -32 <= i < 0:
+        return bytes([i & 0xFF])
+    if 0 <= i <= 0xFF:
+        return b"\xcc" + i.to_bytes(1, "big")
+    if 0 <= i <= 0xFFFF:
+        return b"\xcd" + i.to_bytes(2, "big")
+    if 0 <= i <= 0xFFFFFFFF:
+        return b"\xce" + i.to_bytes(4, "big")
+    if 0 <= i <= 0xFFFFFFFFFFFFFFFF:
+        return b"\xcf" + i.to_bytes(8, "big")
+    if -0x80 <= i < -32:
+        return b"\xd0" + i.to_bytes(1, "big", signed=True)
+    if -0x8000 <= i < -0x80:
+        return b"\xd1" + i.to_bytes(2, "big", signed=True)
+    if -0x80000000 <= i < -0x8000:
+        return b"\xd2" + i.to_bytes(4, "big", signed=True)
+    if -0x8000000000000000 <= i < -0x80000000:
+        return b"\xd3" + i.to_bytes(8, "big", signed=True)
+    raise OverflowError(f"msgpack int範囲外: {i}")
+
+
+def _pack_str(s: str) -> bytes:
+    data = s.encode("utf-8")
+    n = len(data)
+    if n <= 31:
+        return bytes([0xA0 | n]) + data
+    if n <= 0xFF:
+        return b"\xd9" + n.to_bytes(1, "big") + data
+    if n <= 0xFFFF:
+        return b"\xda" + n.to_bytes(2, "big") + data
+    return b"\xdb" + n.to_bytes(4, "big") + data
+
+
+def _map_header(n: int) -> bytes:
+    if n <= 15:
+        return bytes([0x80 | n])
+    if n <= 0xFFFF:
+        return b"\xde" + n.to_bytes(2, "big")
+    return b"\xdf" + n.to_bytes(4, "big")
+
+
+def _array_header(n: int) -> bytes:
+    if n <= 15:
+        return bytes([0x90 | n])
+    if n <= 0xFFFF:
+        return b"\xdc" + n.to_bytes(2, "big")
+    return b"\xdd" + n.to_bytes(4, "big")
+
+
+def _pack_msgpack(obj: Any) -> bytes:
+    """action_hash専用の最小msgpackエンコーダ。dict(fixmap/map16/map32)・
+    list/tuple(fixarray/array16/array32)・str・bool・int(compact)・None・ForceUint64
+    (常に固定8バイトuint64)にのみ対応する。標準の`msgpack`パッケージ(use_bin_type=True)と
+    等価であることを tests/test_signing.py のゴールデンベクタ(HL公式SDK基準)で検証済み。
+    自前実装にした理由: ForceUint64相当(値によらず常に固定8バイト)を標準msgpackパッケージの
+    公開APIだけで特定フィールドにだけ強制する手段が無いため。
+    """
+    if isinstance(obj, bool):
+        return b"\xc3" if obj else b"\xc2"
+    if isinstance(obj, ForceUint64):
+        return b"\xcf" + int(obj).to_bytes(8, "big")
+    if isinstance(obj, int):
+        return _pack_int(obj)
+    if isinstance(obj, str):
+        return _pack_str(obj)
+    if isinstance(obj, dict):
+        body = b"".join(_pack_msgpack(k) + _pack_msgpack(v) for k, v in obj.items())
+        return _map_header(len(obj)) + body
+    if isinstance(obj, (list, tuple)):
+        body = b"".join(_pack_msgpack(v) for v in obj)
+        return _array_header(len(obj)) + body
+    if obj is None:
+        return b"\xc0"
+    raise TypeError(f"_pack_msgpack: 未対応の型 {type(obj)}")
+
+
 def action_hash(action: dict, vault_address: Optional[str], nonce: int) -> bytes:
     """actionHash(action, vaultAddress, nonce) 完全再現。HL公式SDKと同一アルゴリズム
-    (tests/test_signing.py のゴールデンベクタで検証済み)。"""
+    (tests/test_signing.py のゴールデンベクタで検証済み)。
+    `action` にはあらかじめ `wire_action_for_hash()` を通した(必要なら)dict を渡すこと
+    ("type"キー除去等はここでは行わない。低レベルのハッシュ関数として汎用に保つ)。"""
     normalized = _normalize_action(action)
-    packed = msgpack.packb(normalized, use_bin_type=True)
+    packed = _pack_msgpack(normalized)
     buf = bytearray(packed)
     buf += int(nonce).to_bytes(8, "big")
     if vault_address is None:

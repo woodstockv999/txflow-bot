@@ -4,11 +4,18 @@
 - `VITE_API_BASE_URL = "https://api.txflow.com"`
 - `POST /info {"type":"l2Book","coin": <coinIndex文字列>}`
 - `POST /info {"type":"clearinghouseState","user": <address>}`
-- `POST /exchange` に `{action, nonce, signature:{r,s,v}, vaultAddress, expiresAfter}` を送信
-  (setReferrer実装 `A2()` から実測。`isFrontend` フラグが付くケースもあったが用途不明のため送らない)
 - WS: `wss://api.txflow.com/ws`。subscribe形式:
   `{"method":"subscribe","type":"l2Book","subscription":{"type":"l2Book","coin":"1","tick":""}}`
   (HLの`{"coin":"BTC"}`ではなく数値インデックス文字列を使う点が違う。バンドル内`s6.l2Book`定義で確認)
+
+## /exchange envelope はaction種別ごとに違う(2026-07-22、取引画面チャンクTrade.js/
+PositionsModule.js実測。詳細根拠は`txflow_signing.py`冒頭コメント参照)
+- order: `{action:{type:"order",grouping,orders}, signature:{r,s,v}, nonce}` の3キーのみ。
+  **vaultAddress/expiresAfterは送らない**(buildNormalOrderParams実測)。
+- cancel: `{action:{type:"cancel",cancels}, signature, nonce, vaultAddress:null}` の4キー。
+- ハッシュ対象(署名対象のmsgpack)は wire actionから"type"を除いたもの
+  (`signing.wire_action_for_hash()`)。order/cancelの詳しいキー構成・順序・oidの
+  ForceUint64扱いは`txflow_signing.py`のモジュールdocstring参照。
 
 ## coin index の解決 (`data/instruments.json`)
 バンドルの実行時ネットワークタブから採取したと見られる `instruments.json` の `instruments`
@@ -63,18 +70,28 @@ class TxflowApiError(RuntimeError):
         self.body = body
 
 
-def _load_coin_index_map() -> dict[str, str]:
-    """data/instruments.json の instruments[].instrumentType=="perps" から
-    {symbol: externalId文字列} を作る。symbolは "BTC-USDC" の "-USDC" 前の部分。"""
+def _load_symbol_meta() -> dict[str, dict]:
+    """data/instruments.json から {symbol: {"coin_index": externalId文字列,
+    "size_decimals": int}} を作る。
+    - coin_index: instruments[].instrumentType=="perps" の externalId(BTC=1,ETH=2実測済み)。
+    - size_decimals: instruments[].assetBase を鍵に assets[].sizeDecimals を引く
+      (Fable指摘: サイズ量子化に使う。priceTick相当は静的ファイルに無いため
+      `TxflowClient._price_decimals()` でl2Bookの実測小数桁数から動的に推定する)。
+    """
     with open(_INSTRUMENTS_PATH, "r", encoding="utf-8") as f:
         raw = json.load(f)
-    out: dict[str, str] = {}
+    assets_by_index = {a["index"]: a for a in raw.get("assets", [])}
+    out: dict[str, dict] = {}
     for inst in raw.get("instruments", []):
         if inst.get("instrumentType") != "perps":
             continue
         name = inst.get("name", "")
         symbol = name.split("-")[0] if "-" in name else name
-        out[symbol] = str(inst["externalId"])
+        asset = assets_by_index.get(inst.get("assetBase"))
+        # sizeDecimals は負値もありうる(例: DOGE=-1)。負値は「10^|n|単位に丸める」の意味と見て
+        # quantize_size 側で round()の負桁対応を使う。無ければ保守的に0(整数)にフォールバック。
+        size_decimals = int(asset["sizeDecimals"]) if asset else 0
+        out[symbol] = {"coin_index": str(inst["externalId"]), "size_decimals": size_decimals}
     return out
 
 
@@ -109,17 +126,62 @@ class TxflowClient:
             }
         )
         self._nonce = signing.NonceManager()
-        self._coin_index: dict[str, str] = _load_coin_index_map()
+        self._symbol_meta: dict[str, dict] = _load_symbol_meta()
+        self._price_decimals_cache: dict[str, int] = {}
 
     # ------------------------------------------------------------------ coin index
     def coin_index(self, symbol: str) -> str:
         try:
-            return self._coin_index[symbol.upper()]
+            return self._symbol_meta[symbol.upper()]["coin_index"]
         except KeyError as e:
             raise KeyError(
                 f"txflow coin index 不明: {symbol!r}。data/instruments.json に無い"
                 "(新規上場/命名違いの可能性。手動確認要)。"
             ) from e
+
+    # ------------------------------------------------------------------ 価格/サイズ量子化
+    # Fable指摘(2026-07-22): サーバは指定桁数を超えるprice/sizeをrejectする見込み。
+    # size は data/instruments.json の sizeDecimals(静的)、price はpriceTick相当が静的
+    # ファイルに無いため l2Book の実勢価格文字列の小数桁数から動的に推定する
+    # (実際に板に乗っている価格は必ずtickの倍数なので、観測された小数桁数はtickを満たす
+    # 安全な丸め桁数になる)。
+    def quantize_size(self, symbol: str, size: float) -> str:
+        decimals = self._symbol_meta.get(symbol.upper(), {}).get("size_decimals", 0)
+        if decimals >= 0:
+            q = round(size, decimals)
+            return f"{q:.{decimals}f}" if decimals > 0 else f"{q:.0f}"
+        # 負の桁数(例: -1)は 10^|decimals| 単位への丸めと解釈
+        unit = 10 ** (-decimals)
+        q = round(size / unit) * unit
+        return f"{q:.0f}"
+
+    def _price_decimals(self, symbol: str) -> int:
+        symbol = symbol.upper()
+        if symbol in self._price_decimals_cache:
+            return self._price_decimals_cache[symbol]
+        decimals = 2  # 保守的フォールバック(セント単位)
+        try:
+            book = self.get_l2book(symbol)
+            levels = book.get("levels") or [[], []]
+            observed = []
+            for side in levels:
+                for lvl in side[:8]:
+                    px = str(lvl.get("px", ""))
+                    if "." in px:
+                        observed.append(len(px.split(".", 1)[1]))
+                    else:
+                        observed.append(0)
+            if observed:
+                decimals = max(observed)
+        except Exception as e:
+            logger.warning("price decimals推定失敗(%s), 既定%d桁を使用: %s", symbol, decimals, e)
+        self._price_decimals_cache[symbol] = decimals
+        return decimals
+
+    def quantize_price(self, symbol: str, price: float) -> str:
+        decimals = self._price_decimals(symbol)
+        q = round(price, decimals)
+        return f"{q:.{decimals}f}" if decimals > 0 else f"{q:.0f}"
 
     # ------------------------------------------------------------------ low-level HTTP
     def _post(self, path: str, body: dict) -> Any:
@@ -200,22 +262,21 @@ class TxflowClient:
         return self.info("instruments")
 
     # ------------------------------------------------------------------ /exchange (署名必要)
-    def exchange(self, action: dict, vault_address: Optional[str] = None) -> Any:
+    def _require_agent_key(self) -> None:
         if not self.agent_private_key:
             raise RuntimeError(
                 "agent_private_key が設定されていない。実弾発注は不可"
                 "(TXFLOW_AGENT_PRIVATE_KEY 未設定 = 意図した安全装置)。"
             )
+
+    def _sign_wire_action(self, wire_action: dict, vault_address: Optional[str]) -> tuple[dict, int]:
+        """wire_action(サーバに送る"type"付きのaction)から、署名対象("type"を除いたdict、
+        signing.wire_action_for_hash参照)を作ってagent鍵で署名する。"""
+        self._require_agent_key()
+        hash_action = signing.wire_action_for_hash(wire_action)
         nonce = self._nonce.next()
-        sig = signing.sign_l1_action(self.agent_private_key, action, vault_address, nonce, self.network)
-        body = {
-            "action": action,
-            "nonce": nonce,
-            "signature": {"r": sig["r"], "s": sig["s"], "v": sig["v"]},
-            "vaultAddress": vault_address,
-            "expiresAfter": None,
-        }
-        return self._post("/exchange", body)
+        sig = signing.sign_l1_action(self.agent_private_key, hash_action, vault_address, nonce, self.network)
+        return sig, nonce
 
     def submit_approve_agent(self, agent_address: str, agent_name: str, nonce: int, signature: dict) -> Any:
         """ユーザーが別途メインウォレットで署名した ApproveAgent typed-data の signature を
@@ -237,44 +298,70 @@ class TxflowClient:
         }
         return self._post("/exchange", body)
 
-    # ------------------------------------------------------------------ order helpers
-    # NOTE: 発注action("type":"order")のフィールド構成(a/b/p/s/r/t)はバンドル未確認。
-    # HL公式Python SDK (hyperliquid.utils.signing.order_wires_to_order_action) と同一と仮定。
-    # 実弾テストで最初に確認すべき項目(README.md参照)。
-    def build_limit_order_action(
+    # ------------------------------------------------------------------ order/cancel
+    # 2026-07-22実測(Trade.js buildNormalOrderParams / PositionsModule.js cancelOrder。
+    # 根拠の詳細は txflow_signing.py モジュールdocstring参照):
+    # - order wire: {a,b,p,s,r,t} キー順はHLと同一。action全体は{type,grouping,orders}
+    #   (groupingがordersより先)。envelopeは{action,signature,nonce}の3キーのみ
+    #   (vaultAddress/expiresAfterは送らない)。
+    # - tifの実際の文字列値は小文字("gtc"/"post_only"/"ioc")。post-only相当は"post_only"。
+    # - cancel wire: {a,o} (oidは普通の数値)。action全体は{type,cancels}。
+    #   envelopeは{action,signature,nonce,vaultAddress:null}の4キー。
+    TIF_GTC = "gtc"
+    TIF_POST_ONLY = "post_only"
+    TIF_IOC = "ioc"
+
+    def build_limit_order_wire(
         self,
         symbol: str,
         is_buy: bool,
-        price: str,
-        size: str,
+        price: float,
+        size: float,
         reduce_only: bool = False,
-        tif: str = "Gtc",
+        tif: str = TIF_POST_ONLY,
     ) -> dict:
-        return {
-            "type": "order",
-            "orders": [
-                {
-                    "a": int(self.coin_index(symbol)),
-                    "b": is_buy,
-                    "p": price,
-                    "s": size,
-                    "r": reduce_only,
-                    "t": {"limit": {"tif": tif}},
-                }
-            ],
-            "grouping": "na",
+        order_wire = {
+            "a": int(self.coin_index(symbol)),
+            "b": is_buy,
+            "p": self.quantize_price(symbol, price),
+            "s": self.quantize_size(symbol, size),
+            "r": reduce_only,
+            "t": {"limit": {"tif": tif}},
         }
+        return {"type": "order", "grouping": "na", "orders": [order_wire]}
 
-    def build_cancel_action(self, symbol: str, oid: int) -> dict:
-        return {"type": "cancel", "cancels": [{"a": int(self.coin_index(symbol)), "o": oid}]}
+    def build_cancel_wire(self, symbol: str, oid: int) -> dict:
+        return {"type": "cancel", "cancels": [{"a": int(self.coin_index(symbol)), "o": int(oid)}]}
 
-    def place_limit_order(self, symbol: str, is_buy: bool, price: str, size: str,
-                           reduce_only: bool = False, tif: str = "Gtc") -> Any:
-        action = self.build_limit_order_action(symbol, is_buy, price, size, reduce_only, tif)
-        return self.exchange(action)
+    def place_limit_order(self, symbol: str, is_buy: bool, price: float, size: float,
+                           reduce_only: bool = False, tif: str = TIF_POST_ONLY) -> Any:
+        wire_action = self.build_limit_order_wire(symbol, is_buy, price, size, reduce_only, tif)
+        sig, nonce = self._sign_wire_action(wire_action, vault_address=None)
+        body = {
+            "action": wire_action,
+            "signature": {"r": sig["r"], "s": sig["s"], "v": sig["v"]},
+            "nonce": nonce,
+        }
+        return self._post("/exchange", body)
 
     def cancel_order(self, symbol: str, oid: int) -> Any:
-        return self.exchange(self.build_cancel_action(symbol, oid))
+        wire_action = self.build_cancel_wire(symbol, oid)
+        # ハッシュ対象では oid を ForceUint64 でラップする(txflow_signing.py参照: 実測で
+        # JS側は BigInt(oid) を常に固定8バイトでmsgpackエンコードしていたため)。
+        hash_action = signing.wire_action_for_hash(wire_action)
+        hash_action["cancels"] = [
+            {**c, "o": signing.ForceUint64(c["o"])} for c in hash_action["cancels"]
+        ]
+        self._require_agent_key()
+        nonce = self._nonce.next()
+        sig = signing.sign_l1_action(self.agent_private_key, hash_action, None, nonce, self.network)
+        body = {
+            "action": wire_action,
+            "signature": {"r": sig["r"], "s": sig["s"], "v": sig["v"]},
+            "nonce": nonce,
+            "vaultAddress": None,
+        }
+        return self._post("/exchange", body)
 
 
 class TxflowWS:

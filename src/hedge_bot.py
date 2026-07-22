@@ -6,10 +6,17 @@
 状態遷移: IDLE -> LEAD_RESTING -> HEDGED -> HOLD -> UNWIND -> FLAT -> (IDLE)
 
 反映した実測知見(perpl pair_hedgeでの事故から):
-- 取消後は必ず約定有無を再確認する(取消×約定レースで建玉2倍化した前例。live modeのみ、
-  dry_runは単一スレッド逐次シミュレーションなのでレースが起こりえない)
+- 取消後は必ず約定有無を再確認する(取消×約定レースで建玉2倍化した前例)。
+  `_cancel_and_verify()` は "canceled"|"filled"|"unknown" の三値を返し、"filled"なら
+  taker発注をスキップしてmaker約定として扱う("unknown"は安全側でそのtickは何もしない)。
 - 片脚だけ残った stranded leg は reduce-only taker で即時自動決済(IDLE時に毎tick確認)
 - nonce は ms タイムスタンプ単調増加(TxflowClient/NonceManagerで保証済み)
+
+設計変更(2026-07-22 Fableレビュー): txflow BTC/ETHの厚み次第でリード脚のjoinはleg_timeout内に
+刺さらないことがある。リード脚は未約定でもポジションリスクがゼロ(片脚も持っていない)ので、
+taker化(4.5bps支払い)は不要。**リード脚のtimeoutはtaker化せず、取消して即IDLEに戻り
+再クオートする**(abort_reason="lead_timeout_requote")。ヘッジ脚・unwindのtimeoutは
+リスク遮断のためtaker化を維持する。
 """
 
 from __future__ import annotations
@@ -105,6 +112,7 @@ class PairHedgeBot:
         self._cycle_start_ts: Optional[float] = None
         self._hold_until: Optional[float] = None
         self._abort_reason: Optional[str] = None
+        self._lead_requote_streak = 0
 
     # ------------------------------------------------------------------ helpers
     def _mid(self, symbol: str) -> Optional[float]:
@@ -175,8 +183,8 @@ class PairHedgeBot:
                 bid, ask = best
                 is_buy_close = szi < 0  # ショートなら買い戻し、ロングなら売り
                 price = ask if is_buy_close else bid
-                self.client.place_limit_order(symbol, is_buy_close, str(price), str(abs(szi)),
-                                               reduce_only=True, tif="Ioc")
+                self.client.place_limit_order(symbol, is_buy_close, price, abs(szi),
+                                               reduce_only=True, tif=self.client.TIF_IOC)
             except Exception as e:
                 logger.error("stranded leg自動closeに失敗: %s", e)
                 self._notify("stranded_leg_close_failed", "red", f"txflow-bot: stranded leg自動closeに失敗 {symbol}: {e}")
@@ -213,8 +221,7 @@ class PairHedgeBot:
         self._abort_reason = None
 
         if not self.cfg.get("dry_run", True):
-            resp = self._place_maker(base, is_buy_lead, resting_price, size_base)
-            lead.oid = self._extract_oid(resp)
+            lead.oid = self._place_maker(base, is_buy_lead, resting_price, size_base)
 
         self.state = State.LEAD_RESTING
         logger.info("cycle#%d start: lead=%s %s@%.4f size=%.6f", self.cycle_count, base,
@@ -233,12 +240,50 @@ class PairHedgeBot:
 
         timeout = now - lead.resting_since >= float(self.cfg["leg_timeout_seconds"])
         if not filled and timeout:
-            self._convert_leg_to_taker(lead, bid, ask, phase="open")
-            filled = True
-            self._abort_reason = "lead_leg_timeout_taker"
+            # 設計変更(2026-07-22): リード脚は未約定でもポジションリスクがゼロなのでtaker化しない。
+            # 取消して即requote(dry_runにはレースが無いのでcancel_and_verify無しでそのままrequote)。
+            if self.cfg.get("dry_run", True) or lead.oid is None:
+                self._requote_lead(now)
+                return
+            status, fill = self._cancel_and_verify(base, lead.oid)
+            if status == "filled":
+                lead.open_price = float(fill["px"])
+                lead.open_type = "maker"
+                lead.open_fee = float(fill.get("fee", _fee(lead.notional(lead.open_price), True)))
+                lead.open_filled = True
+                filled = True
+            elif status == "unknown":
+                return  # 安全側: このtickは何もしない、次tickで再評価
+            else:
+                self._requote_lead(now)
+                return
 
         if filled:
+            self._lead_requote_streak = 0
             self._start_hedge_leg(now)
+
+    def _requote_lead(self, now: float) -> None:
+        self._lead_requote_streak += 1
+        if self._lead_requote_streak % 20 == 0:
+            logger.warning("lead脚requoteが%d回連続で未約定(cycle#%d、%s)", self._lead_requote_streak,
+                            self.cycle_count, self.cfg["base_symbol"])
+        self._abort_cycle_and_log("lead_timeout_requote", now)
+
+    def _abort_cycle_and_log(self, reason: str, now: float) -> None:
+        rec = {
+            "timestamp": now,
+            "cycle": self.cycle_count,
+            "legs": [],
+            "volume_usd": 0.0,
+            "net_pnl_usd": 0.0,
+            "abort_reason": reason,
+            "dry_run": self.cfg.get("dry_run", True),
+        }
+        self._append_ledger(rec)
+        self.cycle_count += 1
+        self.legs = {}
+        self._abort_reason = None
+        self.state = State.IDLE
 
     def _start_hedge_leg(self, now: float) -> None:
         hedge_sym = self.cfg["hedge_symbol"]
@@ -252,8 +297,7 @@ class PairHedgeBot:
         hedge.resting_since = now
 
         if not self.cfg.get("dry_run", True):
-            resp = self._place_maker(hedge_sym, hedge.is_buy_open, hedge.resting_price, hedge.target_size)
-            hedge.oid = self._extract_oid(resp)
+            hedge.oid = self._place_maker(hedge_sym, hedge.is_buy_open, hedge.resting_price, hedge.target_size)
 
         self.state = State.HEDGED
 
@@ -294,9 +338,8 @@ class PairHedgeBot:
             leg.close_resting_price = bid if is_buy_close else ask
             leg.close_resting_since = now
             if not self.cfg.get("dry_run", True):
-                resp = self._place_maker(leg.symbol, is_buy_close, leg.close_resting_price,
-                                          leg.target_size, reduce_only=True)
-                leg.close_oid = self._extract_oid(resp)
+                leg.close_oid = self._place_maker(leg.symbol, is_buy_close, leg.close_resting_price,
+                                                   leg.target_size, reduce_only=True)
         self.state = State.UNWIND
 
     # ------------------------------------------------------------------ UNWIND
@@ -387,8 +430,8 @@ class PairHedgeBot:
                 bid, ask = best
                 is_buy_close = szi < 0
                 price = ask if is_buy_close else bid
-                self.client.place_limit_order(symbol, is_buy_close, str(price), str(abs(szi)),
-                                               reduce_only=True, tif="Ioc")
+                self.client.place_limit_order(symbol, is_buy_close, price, abs(szi),
+                                               reduce_only=True, tif=self.client.TIF_IOC)
             except Exception as e:
                 logger.error("halt時の強制close失敗 %s: %s", symbol, e)
 
@@ -425,12 +468,23 @@ class PairHedgeBot:
         return leg.close_filled
 
     def _convert_leg_to_taker(self, leg: _Leg, bid: float, ask: float, phase: str) -> None:
+        """指摘1(2026-07-22): 取消×約定レース対策。cancel_and_verifyが"filled"を返したら
+        既にmaker約定していたということなので、taker発注はスキップしてmaker約定として記録する
+        (建玉2倍化を防ぐ)。"unknown"の場合は二重発注リスクを避けてこのtickは何もしない。"""
         if phase == "open":
             price = ask if leg.is_buy_open else bid
             if not self.cfg.get("dry_run", True) and leg.oid is not None:
-                self._cancel_and_verify(leg.symbol, leg.oid)
-                self.client.place_limit_order(leg.symbol, leg.is_buy_open, str(price), str(leg.target_size),
-                                               reduce_only=False, tif="Ioc")
+                status, fill = self._cancel_and_verify(leg.symbol, leg.oid)
+                if status == "filled":
+                    leg.open_price = float(fill["px"])
+                    leg.open_type = "maker"
+                    leg.open_fee = float(fill.get("fee", _fee(leg.notional(leg.open_price), True)))
+                    leg.open_filled = True
+                    return
+                if status == "unknown":
+                    return
+                self.client.place_limit_order(leg.symbol, leg.is_buy_open, price, leg.target_size,
+                                               reduce_only=False, tif=self.client.TIF_IOC)
             leg.open_price = price
             leg.open_type = "taker"
             leg.open_fee = _fee(leg.notional(price), is_maker=False)
@@ -439,39 +493,56 @@ class PairHedgeBot:
             is_buy_close = not leg.is_buy_open
             price = ask if is_buy_close else bid
             if not self.cfg.get("dry_run", True) and leg.close_oid is not None:
-                self._cancel_and_verify(leg.symbol, leg.close_oid)
-                self.client.place_limit_order(leg.symbol, is_buy_close, str(price), str(leg.target_size),
-                                               reduce_only=True, tif="Ioc")
+                status, fill = self._cancel_and_verify(leg.symbol, leg.close_oid)
+                if status == "filled":
+                    leg.close_price = float(fill["px"])
+                    leg.close_type = "maker"
+                    leg.close_fee = float(fill.get("fee", _fee(leg.notional(leg.close_price), True)))
+                    leg.close_filled = True
+                    return
+                if status == "unknown":
+                    return
+                self.client.place_limit_order(leg.symbol, is_buy_close, price, leg.target_size,
+                                               reduce_only=True, tif=self.client.TIF_IOC)
             leg.close_price = price
             leg.close_type = "taker"
             leg.close_fee = _fee(leg.notional(price), is_maker=False)
             leg.close_filled = True
 
-    # ------------------------------------------------------------------ live-mode helpers (未実弾検証)
-    def _place_maker(self, symbol: str, is_buy: bool, price: float, size: float, reduce_only: bool = False):
+    # ------------------------------------------------------------------ live-mode helpers
+    def _place_maker(self, symbol: str, is_buy: bool, price: float, size: float,
+                      reduce_only: bool = False) -> Optional[int]:
+        """maker指値を発注し、oidを返す(見つからなければNone)。
+        実測(2026-07-22 live_order_probe.py): /exchangeのorder応答は
+        `{"status":"ok","response":{"type":"PlaceOrder","data":{"statuses":["success"]}}}`
+        で **oidを含まない**(HL標準の`{"resting":{"oid":...}}}`形ではなかった)。そのため
+        openOrdersをsymbol+side+priceで突き合わせてoidを特定する。"""
         try:
-            resp = self.client.place_limit_order(symbol, is_buy, str(price), str(size),
-                                                   reduce_only=reduce_only, tif="Alo")
+            self.client.place_limit_order(symbol, is_buy, price, size,
+                                           reduce_only=reduce_only, tif=self.client.TIF_POST_ONLY)
             self._error_streak = 0
-            return resp
         except Exception as e:
             self._error_streak += 1
             logger.error("place_limit_order失敗 %s: %s", symbol, e)
             if self._error_streak >= 3:
                 self._notify("error_streak", "red", f"txflow-bot: 発注エラー連発({self._error_streak}回): {e}")
             raise
+        return self._find_oid_by_price(symbol, price, is_buy)
 
-    @staticmethod
-    def _extract_oid(resp) -> Optional[int]:
+    def _find_oid_by_price(self, symbol: str, price: float, is_buy: bool) -> Optional[int]:
         try:
-            statuses = resp["response"]["data"]["statuses"]
-            for st in statuses:
-                if "resting" in st:
-                    return st["resting"]["oid"]
-                if "filled" in st:
-                    return st["filled"]["oid"]
-        except (KeyError, TypeError, IndexError):
-            pass
+            open_orders = self.client.get_open_orders()
+        except Exception as e:
+            logger.warning("openOrders取得失敗(oid特定用): %s", e)
+            return None
+        side = "B" if is_buy else "A"  # 実測: openOrdersのsideは"B"/"A"("buy"/"sell"ではない)
+        price_str = self.client.quantize_price(symbol, price)
+        for o in open_orders or []:
+            coin = str(o.get("coin", "")).split("-")[0].upper()
+            if coin != symbol.upper() or o.get("side") != side:
+                continue
+            if str(o.get("limitPx")) == price_str:
+                return o.get("oid")
         return None
 
     def _check_live_fill(self, leg: _Leg) -> bool:
@@ -527,21 +598,32 @@ class PairHedgeBot:
                 return f
         return None
 
-    def _cancel_and_verify(self, symbol: str, oid: int) -> None:
-        """取消×約定レース対策: 取消後に必ず openOrders/fills で再確認する
-        (perpl pair_hedgeで建玉2倍化した実測知見の反映。未実弾検証)。"""
+    def _cancel_and_verify(self, symbol: str, oid: int) -> tuple[str, Optional[dict]]:
+        """取消×約定レース対策(指摘1、2026-07-22): 取消後に必ず openOrders/fills で
+        再確認する(perpl pair_hedgeで建玉2倍化した実測知見の反映。未実弾検証)。
+        戻り値: ("canceled", None) | ("filled", fill_dict) | ("unknown", None)。
+        呼び出し側は "filled" ならmaker約定として扱い、二重発注(taker化)をスキップすること。
+        "unknown" は openOrders確認自体に失敗した場合の安全側の応答(=何もしない)。"""
         try:
             self.client.cancel_order(symbol, oid)
         except Exception as e:
             logger.warning("cancel_order失敗(既に約定/取消済みの可能性): %s", e)
         try:
             open_orders = self.client.get_open_orders()
-            still_open = any(o.get("oid") == oid for o in (open_orders or []))
-            if still_open:
-                logger.error("取消後もopenOrdersに残存 oid=%s %s -> 手動確認要", oid, symbol)
-                self._notify("cancel_race", "red", f"txflow-bot: 取消後もopenOrdersに残存 oid={oid} {symbol}")
         except Exception as e:
-            logger.warning("取消後のopenOrders再確認に失敗: %s", e)
+            logger.warning("取消後のopenOrders確認に失敗: %s", e)
+            return ("unknown", None)
+        still_open = any(o.get("oid") == oid for o in (open_orders or []))
+        if still_open:
+            logger.error("取消後もopenOrdersに残存 oid=%s %s -> 手動確認要", oid, symbol)
+            self._notify("cancel_race", "red", f"txflow-bot: 取消後もopenOrdersに残存 oid={oid} {symbol}")
+            return ("unknown", None)
+        fill = self._find_fill(symbol, oid)
+        if fill is not None:
+            logger.warning("取消×約定レース検出: oid=%s %s は取消前に約定済みだった -> maker約定として扱う",
+                            oid, symbol)
+            return ("filled", fill)
+        return ("canceled", None)
 
     # ------------------------------------------------------------------ ledger
     def _append_ledger(self, rec: dict) -> None:
