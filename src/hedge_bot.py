@@ -200,7 +200,9 @@ class PairHedgeBot:
         except Exception as e:
             logger.warning("stranded leg確認失敗(clearinghouseState): %s", e)
             return
-        positions = {p["position"]["coin"]: p["position"] for p in chs.get("assetPositions", [])}
+        # clearinghouseStateのcoinは"SOL-USDC"形式(実測)。configの"SOL"表記に正規化して照合する
+        positions = {str(p["position"]["coin"]).split("-")[0].upper(): p["position"]
+                     for p in chs.get("assetPositions", [])}
         for symbol in (self.cfg["base_symbol"], self.cfg["hedge_symbol"]):
             pos = positions.get(symbol)
             if not pos:
@@ -486,7 +488,9 @@ class PairHedgeBot:
         for symbol in (self.cfg["base_symbol"], self.cfg["hedge_symbol"]):
             try:
                 chs = self.client.get_clearinghouse_state()
-                positions = {p["position"]["coin"]: p["position"] for p in chs.get("assetPositions", [])}
+                # clearinghouseStateのcoinは"SOL-USDC"形式(実測)。configの"SOL"表記に正規化して照合する
+                positions = {str(p["position"]["coin"]).split("-")[0].upper(): p["position"]
+                             for p in chs.get("assetPositions", [])}
                 pos = positions.get(symbol)
                 if not pos:
                     continue
@@ -712,7 +716,8 @@ class PairHedgeBot:
             self._notify("startup_reconcile", "red",
                           f"txflow-bot起動: 建玉{len(positions)}件検出({symbols})、reduce-only IOCでフラット化します")
         for pos in positions:
-            symbol = pos["coin"]
+            # coinは"BTC-USDC"形式。client系API(coin_index)は"BTC"表記を取るため正規化
+            symbol = str(pos["coin"]).split("-")[0].upper()
             szi = float(pos.get("szi", 0))
             is_buy_close = szi < 0
             try:
