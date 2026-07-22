@@ -1,14 +1,24 @@
 # txflow-bot 設定
 # dry_run/enabled はどちらも安全側の既定値。実弾を出す変更は明示的な合意の上で行うこと。
 
-base_symbol: SOL
-hedge_symbol: ETH
+# 銘柄選定 2026-07-23(実測): 期待約定時間(板の厚み÷対向フロー)の悪い方が
+#   SOL 32,840秒 / ETH 5,740秒 に対し HBAR 431秒 / ARB 776秒。
+# SOL/ETHではmaker指値が板の厚みに埋もれ、約定は価格スイープ時のみ=逆選択だった。
+# 時間制約を受ける(リード脚が裸になる)ヘッジ側に最速のHBARを置く。
+base_symbol: ARB
+hedge_symbol: HBAR
 notional_usd: 100
-hedge_ratio: 0.87
+hedge_ratio: 1.0        # ARB/HBARとも同程度のβ想定。実測βが出たら見直す
 hold_seconds: 3.0
 leg_timeout_seconds: 60
+max_requotes: 3         # timeout時、taker化の前にタッチへ置き直す回数
 leverage: 3
 daily_loss_limit_usd: 5.0
+
+# 稼働時間帯(サーバ時刻=JST)。00-02時台は効率が落ちる実測に基づき除外。
+active_hours:
+  start_hour: 3
+  end_hour: 24
 
 dry_run: false
 enabled: true

@@ -339,7 +339,8 @@ def test_unwind_lost_identification_proceeds_via_taker_close_to_next_cycle(monke
 
 # ------------------------------------------------------------------ 指摘3: watchdog
 def test_watchdog_fires_when_state_stuck_beyond_threshold():
-    bot = _bot(cfg_overrides={"leg_timeout_seconds": 10})  # 閾値 = 10*2+60 = 80秒
+    # 閾値 = leg_timeout * (max_requotes+1) * 2 + 120 = 10*2*2+120 = 160秒
+    bot = _bot(cfg_overrides={"leg_timeout_seconds": 10, "max_requotes": 1})
     bot.client.open_orders = [{"coin": "BTC-USDC", "oid": 1}, {"coin": "ETH-USDC", "oid": 2}]
     bot.client.clearinghouse_state = {
         "assetPositions": [{"position": {"coin": "ETH", "szi": "-0.42"}}]
@@ -348,7 +349,7 @@ def test_watchdog_fires_when_state_stuck_beyond_threshold():
 
     bot.state = State.UNWIND
     bot.legs = {"BTC": _Leg(symbol="BTC", is_buy_open=True, target_size=0.001)}
-    bot._cycle_start_ts = _time.time() - 100  # 閾値80秒を超過
+    bot._cycle_start_ts = _time.time() - 200  # 閾値160秒を超過
 
     fired = bot._check_watchdog(_time.time())
 

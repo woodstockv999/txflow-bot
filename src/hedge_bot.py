@@ -94,6 +94,7 @@ class _Leg:
     resting_price: Optional[float] = None
     resting_since: Optional[float] = None
     oid: Optional[int] = None
+    open_requotes: int = 0
     # close
     close_price: Optional[float] = None
     close_fee: Optional[float] = None
@@ -102,6 +103,7 @@ class _Leg:
     close_resting_price: Optional[float] = None
     close_resting_since: Optional[float] = None
     close_oid: Optional[int] = None
+    close_requotes: int = 0
 
     def notional(self, price: float) -> float:
         return abs(self.target_size) * price
@@ -171,8 +173,26 @@ class PairHedgeBot:
         self._hold_until: Optional[float] = None
         self._abort_reason: Optional[str] = None
         self._lead_requote_streak = 0
+        self._was_active_hours: Optional[bool] = None
 
     # ------------------------------------------------------------------ helpers
+    def _within_active_hours(self, now: float) -> bool:
+        """稼働時間帯ゲート(2026-07-23)。実測で 00-02時台は効率が落ちるため既定で除外する。
+        設定が無ければ常時稼働。start<=end は同日内、start>end は日跨ぎとして扱う。
+        判定はサーバのローカル時刻(JST)。"""
+        hours = self.cfg.get("active_hours")
+        if not hours:
+            return True
+        start = int(hours.get("start_hour", 0))
+        end = int(hours.get("end_hour", 24))
+        h = time.localtime(now).tm_hour
+        active = (start <= h < end) if start <= end else (h >= start or h < end)
+        if active != self._was_active_hours:
+            logger.info("稼働時間ゲート: %s (%d時, 設定 %d-%d時)",
+                        "稼働開始" if active else "停止(時間外)", h, start, end)
+            self._was_active_hours = active
+        return active
+
     def _throttled_notify(self, context: str, color: str, body: str) -> None:
         """一過性の繰り返し通知(stranded_leg等)が毎回Discordを鳴らさないよう抑止。
         contextごとに3回まで送信、4回目に抑止開始を1回だけ通知、以降は黙る。"""
@@ -224,6 +244,10 @@ class PairHedgeBot:
 
         if self.state == State.IDLE:
             self._reconcile_stranded_legs()
+            # 稼働時間外は新規サイクルを開始しない。進行中のサイクルは中断せず畳ませる
+            # (途中で止めると裸脚が残るため、ゲートはIDLEでのみ効かせる)。
+            if not self._within_active_hours(now):
+                return
             self._try_start_cycle(now)
         elif self.state == State.LEAD_RESTING:
             self._drive_lead_resting(now)
@@ -244,7 +268,10 @@ class PairHedgeBot:
         (呼び出し側はそのtickの通常処理をスキップする)。"""
         if self.state == State.IDLE or self._cycle_start_ts is None:
             return False
-        threshold = float(self.cfg["leg_timeout_seconds"]) * 2 + 60
+        # requote導入(2026-07-23)で正常なサイクルもhedge/unwindでそれぞれ
+        # leg_timeout*(max_requotes+1) かかりうるため、閾値をそれに追随させる。
+        attempts = int(self.cfg.get("max_requotes", 0)) + 1
+        threshold = float(self.cfg["leg_timeout_seconds"]) * attempts * 2 + 120
         elapsed = now - self._cycle_start_ts
         if elapsed < threshold:
             return False
@@ -484,10 +511,22 @@ class PairHedgeBot:
 
         timeout = now - hedge.resting_since >= float(self.cfg["leg_timeout_seconds"])
         if not filled and timeout:
-            self._convert_leg_to_taker(hedge, bid, ask, phase="open")
-            filled = True
-            if self._abort_reason is None:
-                self._abort_reason = "hedge_leg_timeout_taker"
+            # taker化の前にまずタッチへ置き直す(max_requotes回まで)。
+            if hedge.open_requotes < int(self.cfg.get("max_requotes", 0)):
+                r = self._requote_leg(hedge, bid, ask, "open", now)
+                if r == "filled":
+                    filled = True
+                elif r == "lost":
+                    self._abort_cycle_lost_oid(hedge_sym, now,
+                                                also_flatten_leg=self.legs.get(self.cfg["base_symbol"]))
+                    return
+                else:
+                    return  # requoted / unknown → 次tickで再評価
+            else:
+                self._convert_leg_to_taker(hedge, bid, ask, phase="open")
+                filled = True
+                if self._abort_reason is None:
+                    self._abort_reason = "hedge_leg_timeout_taker"
 
         if filled:
             self._hold_until = now + float(self.cfg["hold_seconds"])
@@ -543,10 +582,23 @@ class PairHedgeBot:
 
             timeout = now - leg.close_resting_since >= float(self.cfg["leg_timeout_seconds"])
             if not filled and timeout:
-                self._convert_leg_to_taker(leg, bid, ask, phase="close")
-                filled = True
-                if self._abort_reason is None:
-                    self._abort_reason = "unwind_leg_timeout_taker"
+                # close側もまず置き直す。建玉は残るがヘッジ済みなので方向リスクは限定的。
+                if leg.close_requotes < int(self.cfg.get("max_requotes", 0)):
+                    r = self._requote_leg(leg, bid, ask, "close", now)
+                    if r == "filled":
+                        filled = True
+                    elif r == "lost":
+                        logger.error("unwind requoteのoid特定不能 %s -> taker強制close", leg.symbol)
+                        self._cancel_all_orders_for_symbol(leg.symbol)
+                        self._convert_leg_to_taker(leg, bid, ask, phase="close")
+                        filled = True
+                        if self._abort_reason is None:
+                            self._abort_reason = "unwind_oid_lost_taker"
+                else:
+                    self._convert_leg_to_taker(leg, bid, ask, phase="close")
+                    filled = True
+                    if self._abort_reason is None:
+                        self._abort_reason = "unwind_leg_timeout_taker"
             if not filled:
                 all_closed = False
 
@@ -653,6 +705,56 @@ class PairHedgeBot:
             leg.close_fee = _fee(leg.notional(leg.close_price), is_maker=True)
             leg.close_filled = True
         return leg.close_filled
+
+    def _requote_leg(self, leg: _Leg, bid: float, ask: float, phase: str, now: float) -> str:
+        """timeoutしたmaker脚を、即taker化せず現在のタッチへ置き直す(2026-07-23)。
+        timeoutの主因は「価格が動いて自分の指値がタッチから外れた」ことなので、
+        置き直せばmakerのまま約定する余地が残る。taker化は最後の手段。
+
+        戻り値: "filled"(取消時に既に約定/置き直し直後に約定) | "requoted" |
+                "unknown"(取消結果不明、今tickは何もしない) | "lost"(oid同定不能)
+        """
+        is_open = phase == "open"
+        is_buy = leg.is_buy_open if is_open else not leg.is_buy_open
+        price = bid if is_buy else ask
+        oid = leg.oid if is_open else leg.close_oid
+
+        if not self.cfg.get("dry_run", True):
+            if oid is not None:
+                status, fill = self._cancel_and_verify(leg.symbol, oid)
+                if status == "filled":
+                    _apply_fill(leg, fill, "maker", closing=not is_open)
+                    return "filled"
+                if status == "unknown":
+                    return "unknown"
+            try:
+                st, new_oid, fill = self._place_and_identify(
+                    leg.symbol, is_buy, price, leg.target_size, reduce_only=not is_open)
+            except Exception as e:
+                logger.error("requote発注失敗 %s(%s): %s", leg.symbol, phase, e)
+                return "lost"
+            if st == "lost":
+                return "lost"
+            if is_open:
+                leg.oid = new_oid
+            else:
+                leg.close_oid = new_oid
+            if st == "filled":
+                _apply_fill(leg, fill, "maker", closing=not is_open)
+                return "filled"
+
+        if is_open:
+            leg.resting_price = price
+            leg.resting_since = now
+            leg.open_requotes += 1
+            n = leg.open_requotes
+        else:
+            leg.close_resting_price = price
+            leg.close_resting_since = now
+            leg.close_requotes += 1
+            n = leg.close_requotes
+        logger.info("requote %s(%s) %d回目 -> %.6f", leg.symbol, phase, n, price)
+        return "requoted"
 
     def _convert_leg_to_taker(self, leg: _Leg, bid: float, ask: float, phase: str) -> None:
         """指摘1(2026-07-22): 取消×約定レース対策。cancel_and_verifyが"filled"を返したら
