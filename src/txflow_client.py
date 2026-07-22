@@ -187,6 +187,12 @@ class TxflowClient:
             raise ValueError("user address が無い")
         return self.info("userFills", user=addr)
 
+    def get_open_orders(self, user: Optional[str] = None) -> Any:
+        addr = user or self.main_address
+        if not addr:
+            raise ValueError("user address が無い")
+        return self.info("openOrders", user=addr)
+
     def get_instruments_live(self) -> Any:
         """/info type=instruments を試す(未確認エンドポイント。バンドル内に呼び出し箇所が
         見つからず、instruments.json がどう採取されたか不明なため、失敗しても静的ファイルに

@@ -1,0 +1,14 @@
+# txflow-bot 設定
+# dry_run/enabled はどちらも安全側の既定値。実弾を出す変更は明示的な合意の上で行うこと。
+
+base_symbol: BTC
+hedge_symbol: ETH
+notional_usd: 100
+hedge_ratio: 0.87
+hold_seconds: 3.0
+leg_timeout_seconds: 60
+leverage: 3
+daily_loss_limit_usd: 5.0
+
+dry_run: true
+enabled: false
