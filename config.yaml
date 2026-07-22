@@ -10,7 +10,10 @@ hedge_symbol: HBAR
 notional_usd: 100
 hedge_ratio: 1.0        # ARB/HBARとも同程度のβ想定。実測βが出たら見直す
 hold_seconds: 3.0
-leg_timeout_seconds: 60
+# requote導入前は「待って駄目ならtaker」だったので60秒が妥当だったが、今は
+# 「タッチへ置き直すまでの待ち時間」。薄い板ではタッチが動き続けるため、60秒座り続けるより
+# 短周期で追随した方が刺さる。60秒だと1サイクル10分かかりwatchdogに達していた(2026-07-23実測)。
+leg_timeout_seconds: 30
 max_requotes: 3         # timeout時、taker化の前にタッチへ置き直す回数
 leverage: 3
 daily_loss_limit_usd: 5.0
