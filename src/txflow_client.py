@@ -319,6 +319,7 @@ class TxflowClient:
         size: float,
         reduce_only: bool = False,
         tif: str = TIF_POST_ONLY,
+        cloid: Optional[str] = None,
     ) -> dict:
         # p/s は wire でも末尾ゼロ除去必須(2026-07-22実測): s="0.0030" で送ると
         # 署名側は "0.003" に正規化してハッシュするがサーバは wire 文字列のまま再計算する
@@ -331,14 +332,29 @@ class TxflowClient:
             "r": reduce_only,
             "t": {"limit": {"tif": tif}},
         }
+        if cloid is not None:
+            # "c"フィールド(client order id)。2026-07-22 scripts/cloid_probe.py で実弾検証済み:
+            # openOrdersにcloidがそのままエコーされることを確認(以後oid特定の一次手段に採用)。
+            order_wire["c"] = cloid
         return {"type": "order", "grouping": "na", "orders": [order_wire]}
+
+    @staticmethod
+    def new_cloid() -> str:
+        """実測(2026-07-22 scripts/cloid_probe.py): txflowのcloidは HL標準の `0x`+32hex(16バイト)
+        形式では **"Invalid cloid format" で拒否される**。UUID4文字列
+        ("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")は受理され、openOrdersにそのままエコーされる
+        ことを確認済み(place->openOrders確認->oid経由cancel->確認、まで成功)。"""
+        import uuid
+
+        return str(uuid.uuid4())
 
     def build_cancel_wire(self, symbol: str, oid: int) -> dict:
         return {"type": "cancel", "cancels": [{"a": int(self.coin_index(symbol)), "o": int(oid)}]}
 
     def place_limit_order(self, symbol: str, is_buy: bool, price: float, size: float,
-                           reduce_only: bool = False, tif: str = TIF_POST_ONLY) -> Any:
-        wire_action = self.build_limit_order_wire(symbol, is_buy, price, size, reduce_only, tif)
+                           reduce_only: bool = False, tif: str = TIF_POST_ONLY,
+                           cloid: Optional[str] = None) -> Any:
+        wire_action = self.build_limit_order_wire(symbol, is_buy, price, size, reduce_only, tif, cloid)
         sig, nonce = self._sign_wire_action(wire_action, vault_address=None)
         body = {
             "action": wire_action,

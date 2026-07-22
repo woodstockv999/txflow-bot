@@ -67,6 +67,11 @@ def main() -> None:
     LOG.info("txflow-bot 起動: dry_run=%s base=%s hedge=%s notional=$%s",
               cfg.get("dry_run", True), cfg["base_symbol"], cfg["hedge_symbol"], cfg["notional_usd"])
 
+    # 指摘3(2026-07-22事故対応): 起動時はconfigのsymbolに限らず全open order取消+全建玉フラット化。
+    # config変更(例: BTC->SOL)で見えなくなった建玉が裸で残る事故の再発防止。dry_runでは何もしない。
+    LOG.info("startup_reconcile 実行(live modeのみ実処理)")
+    bot.startup_reconcile()
+
     try:
         while True:
             bot.tick()

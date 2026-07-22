@@ -103,12 +103,70 @@ still_open=False -> OK: 取消確認
 ```
 
 **注記**: `/exchange`のorder応答は`{"status":"ok",...,"statuses":["success"]}`で **oidを含まない**
-(HL標準の`{"resting":{"oid":...}}}`形ではなかった)。`hedge_bot.py`は発注後にopenOrdersを
-symbol+side+priceで突き合わせてoidを特定する(`_find_oid_by_price`)。
+(HL標準の`{"resting":{"oid":...}}}`形ではなかった)。oid特定は当初symbol+side+price文字列一致
+(`_find_oid_by_price`)で実装していたが、下記の実弾事故を機にcloidベースへ全面移行した。
 
 **注記2**: notionalの許容範囲は当初「$10-12」だったが、BTCのsize量子化(sizeDecimals=4→
 最小刻み0.0001BTC≈$6.5)だと$10-12の間に量子化後の値が存在しない。$13.05(最も近い達成可能値)を
 採用した。
+
+## 実弾稼働事故と修正(2026-07-22 19:35-19:48 BTC)
+
+hedge_botを実弾稼働(BTC/ETH)させたところ、lead注文は実際に5回約定していた(買い0.0015×2、
+売り0.0015+0.0014+0.0001)のに、bot側は全サイクルを"lead_timeout_requote"と誤認し続けた。
+原因は `_find_oid_by_price`(symbol+side+price文字列一致でopenOrdersからoidを探す)がサーバの
+echo文字列と一致せず失敗し、oidが取れない→約定検知不能→取消も不能→注文が板に堆積、という
+連鎖。さらにconfigをBTCからSOLに切り替えて再起動した際、botが見ていないBTC建玉0.0030が
+裸で残った(手動決済済み)。
+
+### 修正1: wireの末尾ゼロ除去
+`build_limit_order_wire`のp/sに`signing._trim_trailing_zeros`を適用。実測: `s="0.0030"`だと
+`Authorization failed`になる(署名側は`"0.003"`に正規化してハッシュするがサーバはwire文字列の
+まま再計算するため不一致)。回帰テスト: `tests/test_client.py`。
+
+### 修正2: cloidベースのoid特定(最重要)
+`scripts/cloid_probe.py`で実測: **txflowのcloidはHL標準の`0x`+32hex(16バイト)形式では
+"Invalid cloid format"で拒否され、UUID4文字列("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")は
+受理・openOrdersにそのままエコーされる**(place→openOrders確認→oid経由cancel→確認、まで成功)。
+生ログ(署名は伏せる):
+
+```
+trying UUID cloid: 80f969de-f58c-4e50-bae2-86fe818208a5
+{"status": "ok", "response": {"type": "PlaceOrder", "data": {"statuses": ["success"]}}}
+
+openOrders: [{"coin": "BTC-USDC", "limitPx": "52786.6", "oid": 189747539553, "side": "B",
+              "sz": "0.0002", "timestamp": 1784717728036,
+              "cloid": "80f969de-f58c-4e50-bae2-86fe818208a5"}]
+
+cancelling oid 189747539553
+{"status": "ok", "response": {"type": "CancelOrder", "data": {"statuses": ["success"]}}}
+after cancel: []
+```
+
+(なお `0x`+32hex形式は`{"status":"err","response":"Invalid cloid format"}`で拒否確認済み)。
+
+cancelByCloid相当のaction schemaはバンドル内に見つからず、追加の実弾発注は指示の予算
+(遠値post-only 1-2発)を超えるため未検証。oid経由の取消は既に確定済みのため、cloidは
+**識別専用**(発注後にopenOrdersをcloidで突き合わせてoidを回収する)として使う。
+
+`hedge_bot._place_and_identify()` に全面移行:
+1. 発注時に毎回UUID4 cloidを付与
+2. openOrdersを300ms間隔で最大5回ポーリングし、cloid一致でoidを回収 → `"resting"`
+3. 見つからなければuserFills(発注時刻以降・symbol・side一致)で即時約定を確認 → `"filled"`
+4. どちらでも同定できなければ `"lost"` を返す。呼び出し側は該当symbolの全open orderを
+   取消し(`_cancel_all_orders_for_symbol`)、サイクルを中断してIDLEへ戻る
+   (`_abort_cycle_lost_oid`。ヘッジ脚の同定失敗時はリード脚もtakerで強制close)。
+
+fill検知(`_check_live_fill`系)もoid単独マッチをやめ、oidに紐づく`userFills`を直接集約する
+方式(`_find_fill`)に統一。**部分約定はsize合算で判定**(複数fillレコードのsize合計が
+目標サイズに達したら約定とみなし、サイズ加重平均価格を採用)。
+
+### 修正3: 起動時リコンサイル強化
+`PairHedgeBot.startup_reconcile()`(`main.py`から起動時に1回呼ぶ)を新設。config変更で
+見えなくなる建玉の再発防止に、**symbol不問**で(a) 全open orderを取消 (b) clearinghouseState
+の全建玉をreduce-only IOCでフラット化し、WARNING+discord通知する。既存の
+`_reconcile_stranded_legs`(毎IDLE tick、configのsymbolだけを見る軽量チェック)は稼働中の
+補助として維持。
 
 ## 実弾テスト手順(再掲)
 
@@ -118,30 +176,41 @@ python3 scripts/live_order_probe.py
 
 # 2. 実発注→openOrders確認→取消→取消確認
 python3 scripts/live_order_probe.py --confirm
+
+# 3. cloid疎通確認(遠値post-only→openOrdersでcloidエコー確認→oid経由cancel→確認)
+python3 scripts/cloid_probe.py
 ```
 
 ## ファイル構成
 
 - `src/txflow_signing.py` — msgpack action hash + EIP-712 agent署名。ApproveAgent typed-data生成。
-- `src/txflow_client.py` — REST(/info, /exchange)・WS(l2Book)クライアント。
+- `src/txflow_client.py` — REST(/info, /exchange)・WS(l2Book)クライアント。price/size量子化。
 - `src/hedge_bot.py` — pair_hedge状態機械(IDLE→LEAD_RESTING→HEDGED→HOLD→UNWIND→FLAT)。
-- `main.py` — ループ本体。`enabled:false`の間は待機のみ。
+  cloidベースのoid特定・起動時リコンサイル。
+- `main.py` — ループ本体。`enabled:false`の間は待機のみ。起動時に`startup_reconcile()`を実行。
 - `scripts/live_order_probe.py` — 実弾疎通テスト専用スクリプト(1回限り、手動実行)。
+- `scripts/cloid_probe.py` — cloid疎通テスト専用スクリプト(1回限り、手動実行)。
 - `data/instruments.json` — coin index解決用の静的参照データ(168資産)。
 - `data/cycles.jsonl` — サイクル台帳(gitignore対象、実行時生成)。
 - `tests/test_signing.py` — 署名ユニットテスト(HL公式SDKとのゴールデンベクタ照合含む)。
+- `tests/test_client.py` — TxflowClientユニットテスト(末尾ゼロ除去の回帰テスト含む)。
+- `tests/test_hedge_bot.py` — hedge_botユニットテスト(cloid特定・部分約定合算・起動時
+  リコンサイルの回帰テスト含む、フェイクclientでネットワーク不要)。
 
 ## 既知の制約・要検証項目
 
-- **発注(order)・取消(cancel)は実弾検証済み**(上記2026-07-22記録)。
-- `type=userFills` はHL標準を仮定して実装しているが未検証(取消×約定レース確認・stranded leg
-  自動close・taker化フォールバックで使う。live modeでのみ使用、現状dry_run既定のため未到達コード。
-  次に実弾検証すべき最有力項目)。
+- **発注(order)・取消(cancel)・cloid識別は実弾検証済み**(上記2026-07-22記録)。
+- **cancelByCloid相当は未検証**(未使用。oid経由のcancelで代替)。
+- `userFills`は実アカウントの実売買履歴で構造確認済み(cloidフィールドは無い。oid/symbol/side/
+  time/px/sz/feeで照合する設計)。
 - `updateLeverage`/`modifyOrder`/TP-SL関連actionは本bot未使用だが、構造は
   `src/txflow_signing.py`冒頭コメントに記録済み(将来使う場合の参考)。
 - price量子化(`TxflowClient._price_decimals`)はl2Bookの実勢価格の小数桁数から動的推定している
   (priceTick相当のメタデータがinstruments.jsonに無いため)。今回の実弾テストでは65235.9(1桁)が
   acceptされたので少なくともBTCでは機能している。
+- 実アカウントの現在のレバレッジは`userFills`実測で10倍(config.yamlの`leverage:3`とは不一致)。
+  botは`updateLeverage`を呼ばないため、取引所側の既定/前回設定がそのまま使われる。設定を
+  同期させたい場合は別途対応が必要(今回のタスク範囲外、観察事項として記録)。
 - WSのl2Book購読は `coin:"1"` のような数値インデックス文字列で送るが、**応答の`data.coin`は
   `"BTC-USDC"`のようなシンボル名で返る**(2026-07-22 smoke testで実測・実装済み)。
 - **日次損失窓(`daily_loss_limit_usd`)はプロセス内メモリで保持しており、プロセス再起動で
