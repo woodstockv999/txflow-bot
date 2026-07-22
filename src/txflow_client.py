@@ -320,11 +320,14 @@ class TxflowClient:
         reduce_only: bool = False,
         tif: str = TIF_POST_ONLY,
     ) -> dict:
+        # p/s は wire でも末尾ゼロ除去必須(2026-07-22実測): s="0.0030" で送ると
+        # 署名側は "0.003" に正規化してハッシュするがサーバは wire 文字列のまま再計算する
+        # ため Authorization failed になる。wire==正規化済み文字列 に揃える。
         order_wire = {
             "a": int(self.coin_index(symbol)),
             "b": is_buy,
-            "p": self.quantize_price(symbol, price),
-            "s": self.quantize_size(symbol, size),
+            "p": signing._trim_trailing_zeros(self.quantize_price(symbol, price)),
+            "s": signing._trim_trailing_zeros(self.quantize_size(symbol, size)),
             "r": reduce_only,
             "t": {"limit": {"tif": tif}},
         }
