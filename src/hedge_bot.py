@@ -584,6 +584,9 @@ class PairHedgeBot:
             return True
         logger.warning("close完了と判定されたが建玉が残っている %s szi=%s -> 残量を閉じ直す",
                        leg.symbol, szi)
+        # close_oidを捨てる前に板の残注文を掃除する。放置すると取消対象を見失い孤児化する
+        # (2026-07-23実測: 取消失敗した close 注文が板に残ったままoidだけクリアされた)。
+        self._cancel_all_orders_for_symbol(leg.symbol)
         leg.close_filled = False
         leg.close_oid = None
         leg.close_size = None
