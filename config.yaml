@@ -6,10 +6,10 @@
 # の最前列に立てるので出来高スループットが桁違い(SOL/ETH時代 $8,000/時級)。
 # ※ARBはspread=1tickで内側の隙間が無く、この方式が効かないため不採用。BTC/ETH/SOLは
 #   spread=2tickで内側1tick出せる(実測確認済み)。
-base_symbol: BTC
+base_symbol: SOL
 hedge_symbol: ETH
 notional_usd: 100
-hedge_ratio: 1.0        # BTC/ETH同notionalヘッジ。実測βが出たら見直す
+hedge_ratio: 0.87       # perpl SOL/ETH の実績値
 hold_seconds: 3.0
 leg_timeout_seconds: 60
 max_requotes: 3         # timeout時、taker化の前にタッチ内側へ置き直す回数
