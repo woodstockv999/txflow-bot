@@ -154,7 +154,9 @@ class PairHedgeBot:
         self.ws = ws
         self.ledger_path = Path(ledger_path)
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        self._notify = notify_fn or (lambda *a, **k: None)
+        self._raw_notify = notify_fn or (lambda *a, **k: None)
+        self._notify_counts: dict[str, int] = {}
+        self._notify = self._throttled_notify
 
         self.state = State.IDLE
         self.cycle_count = 0
@@ -171,6 +173,16 @@ class PairHedgeBot:
         self._lead_requote_streak = 0
 
     # ------------------------------------------------------------------ helpers
+    def _throttled_notify(self, context: str, color: str, body: str) -> None:
+        """一過性の繰り返し通知(stranded_leg等)が毎回Discordを鳴らさないよう抑止。
+        contextごとに3回まで送信、4回目に抑止開始を1回だけ通知、以降は黙る。"""
+        n = self._notify_counts.get(context, 0) + 1
+        self._notify_counts[context] = n
+        if n <= 3:
+            self._raw_notify(context, color, body)
+        elif n == 4:
+            self._raw_notify(context, "gray", f"txflow-bot: {context} が繰り返し発生のため以降の通知は抑止")
+
     def _mid(self, symbol: str) -> Optional[float]:
         ba = self.ws.best_bid_ask(symbol)
         if not ba:
