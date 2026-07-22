@@ -117,6 +117,11 @@ def _apply_fill(leg: _Leg, fill: dict, order_type: str, closing: bool) -> None:
         leg.open_type = order_type
         leg.open_fee = float(fill["fee"])
         leg.open_filled = True
+        # 部分約定対応(2026-07-22実測: 取消×約定レースで0.54/1.29のみ約定)。
+        # 実約定量をこの脚の正とし、以降のヘッジサイズ・決済サイズを実勢に合わせる。
+        filled_sz = float(fill.get("sz", 0) or 0)
+        if filled_sz > 0:
+            leg.target_size = filled_sz
 
 
 class PairHedgeBot:
@@ -237,8 +242,11 @@ class PairHedgeBot:
 
         notional = float(self.cfg["notional_usd"])
         hedge_ratio = float(self.cfg["hedge_ratio"])
-        size_base = round(notional / mid_base, 6)
-        size_hedge = round((notional * hedge_ratio) / mid_hedge, 6)
+        # target_size は wire に載る量子化後サイズと一致させる(2026-07-22実測: 未量子化の
+        # 0.045149 に対し wire "0.045" が約定し、99.9%充足判定が永遠に満たされず全脚が
+        # 60秒待ち→取消レース検知扱いになっていた)
+        size_base = float(self.client.quantize_size(base, notional / mid_base))
+        size_hedge = float(self.client.quantize_size(hedge, (notional * hedge_ratio) / mid_hedge))
 
         is_buy_lead = self._lead_toggle
         self._lead_toggle = not self._lead_toggle
@@ -340,6 +348,14 @@ class PairHedgeBot:
         # 60秒裸→taker化を毎サイクル踏む
         hedge.resting_price = bid if hedge.is_buy_open else ask
         hedge.resting_since = now
+
+        # リード脚が部分約定だった場合に備え、ヘッジは実約定ノーショナル基準でサイズし直す
+        lead = self.legs.get(self.cfg["base_symbol"])
+        if lead is not None and lead.open_price and lead.target_size:
+            lead_notional = lead.target_size * lead.open_price
+            mid = (bid + ask) / 2
+            hedge.target_size = float(self.client.quantize_size(
+                hedge_sym, lead_notional * float(self.cfg["hedge_ratio"]) / mid))
 
         if self.cfg.get("dry_run", True):
             self.state = State.HEDGED

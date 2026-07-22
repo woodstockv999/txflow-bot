@@ -38,6 +38,9 @@ class FakeClient:
     def quantize_price(self, symbol, price):
         return f"{price:.2f}"
 
+    def quantize_size(self, symbol, size):
+        return f"{size:.4f}"
+
     def place_limit_order(self, symbol, is_buy, price, size, reduce_only=False, tif="post_only", cloid=None):
         oid = self._next_oid
         self._next_oid += 1
