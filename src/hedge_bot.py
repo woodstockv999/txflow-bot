@@ -293,7 +293,9 @@ class PairHedgeBot:
             # 板が無ければリード脚だけ持って待つ(次tickで再試行)
             return
         bid, ask = best
-        hedge.resting_price = ask if hedge.is_buy_open else bid
+        # 買いはbid・売りはaskにjoin(lead脚と同じ)。逆に置くとpost_onlyが必ずrejectされ
+        # 60秒裸→taker化を毎サイクル踏む
+        hedge.resting_price = bid if hedge.is_buy_open else ask
         hedge.resting_since = now
 
         if not self.cfg.get("dry_run", True):
