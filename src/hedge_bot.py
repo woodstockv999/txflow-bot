@@ -775,10 +775,22 @@ class PairHedgeBot:
                     return
                 if status == "unknown":
                     return
+            size = leg.target_size
+            if not is_open:
+                # 2026-07-23: close側は実建玉に合わせる。既にフラットなら発注せず畳む
+                # (従来は必ず発注し、拒否されてから実ポジションを見ていた)。
+                szi = self._position_szi(leg.symbol)
+                if szi is not None:
+                    if abs(szi) < 1e-9:
+                        logger.info("taker close不要 %s: 実建玉が既にゼロ -> close済みとして扱う", leg.symbol)
+                        _apply_fill(leg, {"px": price, "sz": 0.0, "fee": 0.0}, "taker", closing=True)
+                        return
+                    size = min(size, abs(szi))
+
             resp = None
             err = None
             try:
-                resp = self.client.place_limit_order(leg.symbol, is_buy, price, leg.target_size,
+                resp = self.client.place_limit_order(leg.symbol, is_buy, price, size,
                                                        reduce_only=not is_open, tif=self.client.TIF_IOC)
             except Exception as e:
                 err = e
@@ -827,7 +839,9 @@ class PairHedgeBot:
     # ------------------------------------------------------------------ live-mode helpers
     # 2026-07-22事故2: openOrdersの伝播ラグは実測2-3秒あり、従来1.5秒(5回×0.3秒)では
     # 不足するケースがあった。8回×0.5秒(計4秒)へ延長。
-    OID_POLL_ATTEMPTS = 8
+    # 2026-07-23: 4秒窓では"lost"が多発した(拒否ではなくstatus okのまま見つからない)。
+    # 伝播ラグが窓を超えている可能性が高いので8秒へ延長する。
+    OID_POLL_ATTEMPTS = 16
     OID_POLL_INTERVAL_SEC = 0.5
 
     def _place_and_identify(self, symbol: str, is_buy: bool, price: float, size: float,
@@ -847,11 +861,23 @@ class PairHedgeBot:
           ("lost", None, None)    — どちらでも同定できず。呼び出し元は該当symbolの全open order
                                      取消(`_cancel_all_orders_for_symbol`)とcycle中断が必須。
         """
+        # 2026-07-23: post_onlyがstatus okのまま消える事象の対策。呼び出し元が渡す価格は
+        # WS板由来で数百msの遅れがあり、ARB/HBARのような薄く速い板では発注がエンジンに
+        # 届く頃にクロス側へ回りpost_onlyが(非同期に)棄却される。発注直前にRESTで板を
+        # 取り直し、絶対にクロスしない価格へクランプする(=常に最新のタッチにjoinする)。
+        price = self._clamp_price_to_passive(symbol, is_buy, price)
+
+        if reduce_only:
+            size = self._clamp_size_to_position(symbol, size)
+            if not size or size <= 0:
+                logger.info("reduce-only発注をスキップ %s: 実建玉が既にゼロ", symbol)
+                return "lost", None, None  # 呼び出し元のtaker経路が「既にフラット」を検出して畳む
+
         cloid = self.client.new_cloid()
         placed_at_ms = int(time.time() * 1000)
         try:
-            self.client.place_limit_order(symbol, is_buy, price, size, reduce_only=reduce_only,
-                                           tif=self.client.TIF_POST_ONLY, cloid=cloid)
+            resp = self.client.place_limit_order(symbol, is_buy, price, size, reduce_only=reduce_only,
+                                                  tif=self.client.TIF_POST_ONLY, cloid=cloid)
             self._error_streak = 0
         except Exception as e:
             self._error_streak += 1
@@ -859,6 +885,14 @@ class PairHedgeBot:
             if self._error_streak >= 3:
                 self._notify("error_streak", "red", f"txflow-bot: 発注エラー連発({self._error_streak}回): {e}")
             raise
+
+        # 2026-07-23: 従来はレスポンスを捨てていた。発注が拒否(post_onlyのクロス等)されても
+        # 4秒ポーリングして「同定できず=lost」と誤診断し、理由不明のままtaker化に落ちていた。
+        # 拒否は即座に、実際のエラー本文つきで返す。
+        if isinstance(resp, dict) and resp.get("status") != "ok":
+            logger.error("発注が拒否された %s is_buy=%s px=%s sz=%s reduce_only=%s: %s",
+                         symbol, is_buy, price, size, reduce_only, resp.get("response"))
+            return "lost", None, None  # 呼び出し元の扱いは従来の"lost"と同じで良い
 
         for _ in range(self.OID_POLL_ATTEMPTS):
             time.sleep(self.OID_POLL_INTERVAL_SEC)
@@ -886,9 +920,53 @@ class PairHedgeBot:
             total_fee = sum(float(f.get("fee", 0)) for f in matched)
             return "filled", None, {"px": weighted_px, "sz": total_sz, "fee": total_fee}
 
-        logger.error("発注後、openOrders/userFillsどちらでも同定できず(cloid=%s symbol=%s)。cycle中断",
-                     cloid, symbol)
+        # 2026-07-23: 原因切り分け用。拒否でもなく約定でもなく消える注文の正体を掴むため、
+        # 失敗時点でのその銘柄のopenOrdersと直近fillsを実際に吐く。
+        try:
+            oo_dump = [{k: o.get(k) for k in ("oid", "cloid", "side", "sz", "limitPx")}
+                       for o in (self.client.get_open_orders() or [])
+                       if str(o.get("coin", "")).split("-")[0].upper() == symbol.upper()]
+        except Exception as e:
+            oo_dump = f"取得失敗: {e}"
+        try:
+            fl_dump = [{k: f.get(k) for k in ("oid", "side", "sz", "px", "time")}
+                       for f in (self.client.get_user_fills() or [])
+                       if str(f.get("coin", "")).upper() == symbol.upper()][:3]
+        except Exception as e:
+            fl_dump = f"取得失敗: {e}"
+        logger.error("発注後、openOrders/userFillsどちらでも同定できず(cloid=%s symbol=%s "
+                     "is_buy=%s px=%s sz=%s reduce_only=%s placed_at=%d)。cycle中断 "
+                     "| 現在のopenOrders(%s)=%s | 直近fills=%s",
+                     cloid, symbol, is_buy, price, size, reduce_only, placed_at_ms,
+                     symbol, oo_dump, fl_dump)
         return "lost", None, None
+
+    def _clamp_size_to_position(self, symbol: str, size: float) -> Optional[float]:
+        """reduce-only発注のサイズを実建玉以下に収める。close側の部分約定はtarget_sizeに
+        反映されない(=_apply_fillのサイズ更新はopen側のみ)ため、建玉が目標より小さくなると
+        "New order will increase your position"で拒否され、unwindがtaker強制closeへ落ちていた
+        (2026-07-23実測)。取得失敗時はNoneでなく元サイズを返す(安全側=従来動作)。"""
+        szi = self._position_szi(symbol)
+        if szi is None:
+            return size
+        return min(size, abs(szi))
+
+    def _clamp_price_to_passive(self, symbol: str, is_buy: bool, price: float) -> float:
+        """post_onlyがクロスして棄却されないよう、直近のRESTの板で価格をパッシブ側へ寄せる。
+        買いは現在のbid以下、売りは現在のask以上に必ず収める。板が取れなければ元の価格を返す
+        (安全側=従来動作)。"""
+        try:
+            lv = self.client.get_l2book(symbol)["levels"]
+            bid = float(lv[0][0]["px"])
+            ask = float(lv[1][0]["px"])
+        except Exception as e:
+            logger.warning("発注前の板再取得に失敗 %s(クランプ省略): %s", symbol, e)
+            return price
+        clamped = min(price, bid) if is_buy else max(price, ask)
+        if clamped != price:
+            logger.info("発注価格をクランプ %s is_buy=%s %.8f -> %.8f (bid=%s ask=%s)",
+                        symbol, is_buy, price, clamped, bid, ask)
+        return clamped
 
     def _cancel_all_orders_for_symbol(self, symbol: str) -> None:
         """指摘2/3: oid特定不能時・起動時リコンサイルで使う、symbol指定の全open order取消。"""
