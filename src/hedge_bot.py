@@ -917,10 +917,9 @@ class PairHedgeBot:
           ("lost", None, None)    — どちらでも同定できず。呼び出し元は該当symbolの全open order
                                      取消(`_cancel_all_orders_for_symbol`)とcycle中断が必須。
         """
-        # 2026-07-23: 発注直前にRESTで板を取り直し、タッチ内側1tickに置く(自分が新ベスト=
-        # キュー先頭)。WS板由来の古い価格でpost_onlyがクロス棄却される事象も同時に潰れる
-        # (内側1tickは必ず bid<p<ask に収まるため)。
-        price = self._inside_price(symbol, is_buy, price)
+        # 2026-07-23: 発注直前にRESTで板を取り直し、pricing_mode に従い価格を決める
+        # (inside=内側1tick / touch=タッチjoin)。WS板由来の古い価格でのクロス棄却も同時に潰れる。
+        price = self._price_for_place(symbol, is_buy, price)
 
         if reduce_only:
             size = self._clamp_size_to_position(symbol, size)
@@ -1011,6 +1010,27 @@ class PairHedgeBot:
         if szi is None:
             return size
         return abs(szi)
+
+    def _price_for_place(self, symbol: str, is_buy: bool, fallback: float) -> float:
+        """発注価格の決定。pricing_mode で内側1tick/タッチjoinを切り替える(2026-07-23)。
+        - "inside": タッチ内側1tick(自分が新ベスト)。厚い板(BTC/ETH)で刺さるが、tickが価格に
+          対し大きい銘柄はコスト大。
+        - "touch"(既定): タッチにjoin(perpl純正)。薄い板(ARB/HBAR)で効率9,631の実績。"""
+        if self.cfg.get("pricing_mode", "touch") == "inside":
+            return self._inside_price(symbol, is_buy, fallback)
+        return self._touch_price(symbol, is_buy, fallback)
+
+    def _touch_price(self, symbol: str, is_buy: bool, fallback: float) -> float:
+        """タッチjoin。post_onlyがクロス棄却されないよう、RESTの最新板でパッシブ側
+        (買いはbid以下・売りはask以上)に収める。板が取れなければ元の価格。"""
+        try:
+            lv = self.client.get_l2book(symbol)["levels"]
+            bid = float(lv[0][0]["px"])
+            ask = float(lv[1][0]["px"])
+        except Exception as e:
+            logger.warning("発注前の板再取得に失敗 %s(タッチ化省略): %s", symbol, e)
+            return fallback
+        return min(fallback, bid) if is_buy else max(fallback, ask)
 
     def _inside_price(self, symbol: str, is_buy: bool, fallback: float) -> float:
         """タッチ内側1tickに出す(2026-07-23、perplはタッチjoinだったのに対する改良)。

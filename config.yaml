@@ -1,18 +1,21 @@
 # txflow-bot 設定
 # dry_run/enabled はどちらも安全側の既定値。実弾を出す変更は明示的な合意の上で行うこと。
 
-# 銘柄 2026-07-23: BTC/ETHへ回帰。価格を「タッチ内側1tick」に出す方式(_inside_price)に
-# したため、板が厚くても自分が新ベスト=キュー先頭で先客を飛ばして刺さる。厚い板=巨大フロー
-# の最前列に立てるので出来高スループットが桁違い(SOL/ETH時代 $8,000/時級)。
-# ※ARBはspread=1tickで内側の隙間が無く、この方式が効かないため不採用。BTC/ETH/SOLは
-#   spread=2tickで内側1tick出せる(実測確認済み)。
-base_symbol: SOL
-hedge_symbol: ETH
+# 銘柄/方式 2026-07-23: ARB/HBAR + タッチjoin(pricing_mode:touch)へ回帰。
+# 実測比較(効率=出来高÷損失):
+#   ARB/HBAR タッチjoin  効率9,631  スループット$1,500/時  ← 採用(効率最優先)
+#   BTC/ETH  内側1tick   効率2,606  $10,803/時
+#   SOL/ETH  内側1tick   効率2,049  $4,645/時
+# 厚い板(BTC/ETH)は内側1tickで刺さるがtickコストで効率が沈む。薄い板(ARB/HBAR)は
+# タッチjoinで先客が少なく刺さり、内側1tickコストを払わないので効率が最大。
+base_symbol: ARB
+hedge_symbol: HBAR
 notional_usd: 100
-hedge_ratio: 0.87       # perpl SOL/ETH の実績値
+hedge_ratio: 1.0
 hold_seconds: 3.0
 leg_timeout_seconds: 60
-max_requotes: 3         # timeout時、taker化の前にタッチ内側へ置き直す回数
+max_requotes: 3
+pricing_mode: touch     # touch=タッチjoin(薄板向き) / inside=内側1tick(厚板向き)
 leverage: 3
 daily_loss_limit_usd: 5.0
 
