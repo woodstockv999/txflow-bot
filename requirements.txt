@@ -1,0 +1,5 @@
+requests>=2.31
+websocket-client>=1.7
+eth-account>=0.13
+msgpack>=1.0
+PyYAML>=6.0
