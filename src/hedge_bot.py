@@ -572,6 +572,24 @@ class PairHedgeBot:
         self.state = State.UNWIND
 
     # ------------------------------------------------------------------ UNWIND
+    def _verify_leg_flat(self, leg: _Leg, now: float) -> bool:
+        """close脚の「閉じ切った」判定を実建玉で裏取りする(2026-07-23)。
+
+        close_filledは約定を1件でも確認すれば立つが、取消×約定レースで**部分約定**を
+        掴んだ場合も立ってしまう(実測: 建玉1106に対しレース約定313でclose完了と誤判定→
+        残り793がstranded legとしてサイクル外にこぼれ、takerで処理されていた)。
+        建玉が残っていたらclose状態を巻き戻し、次tickで残量を閉じ直させる。"""
+        szi = self._position_szi(leg.symbol)
+        if szi is None or abs(szi) < 1e-9:
+            return True
+        logger.warning("close完了と判定されたが建玉が残っている %s szi=%s -> 残量を閉じ直す",
+                       leg.symbol, szi)
+        leg.close_filled = False
+        leg.close_oid = None
+        leg.close_size = None
+        leg.close_resting_since = now  # timeout計測をやり直す
+        return False
+
     def _drive_unwind(self, now: float) -> None:
         all_closed = True
         for leg in self.legs.values():
@@ -604,6 +622,9 @@ class PairHedgeBot:
                     filled = True
                     if self._abort_reason is None:
                         self._abort_reason = "unwind_leg_timeout_taker"
+            # 「閉じた」と判断したら実建玉で裏取りする。残っていれば未完了に戻す。
+            if filled and not self.cfg.get("dry_run", True):
+                filled = self._verify_leg_flat(leg, now)
             if not filled:
                 all_closed = False
 
