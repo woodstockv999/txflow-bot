@@ -844,8 +844,25 @@ class PairHedgeBot:
     OID_POLL_ATTEMPTS = 16
     OID_POLL_INTERVAL_SEC = 0.5
 
+    PLACE_ATTEMPTS = 2
+
     def _place_and_identify(self, symbol: str, is_buy: bool, price: float, size: float,
                              reduce_only: bool = False) -> tuple[str, Optional[int], Optional[dict]]:
+        """発注してcloidでoidを特定する。消滅(=post_onlyの非同期棄却と推定)は板が薄いと
+        一定確率で起きるため、PLACE_ATTEMPTS回まで即座に置き直す(2026-07-23)。
+        openは建玉リスクを増やさず、closeもサイズを実建玉にクランプ済みなので安全。
+        再試行の前にその銘柄の残注文を掃除し、見落としによる二重発注を防ぐ。"""
+        for attempt in range(self.PLACE_ATTEMPTS):
+            status, oid, fill = self._place_and_identify_once(symbol, is_buy, price, size, reduce_only)
+            if status != "lost" or attempt == self.PLACE_ATTEMPTS - 1:
+                return status, oid, fill
+            logger.warning("発注が消えたため置き直す %s (%d/%d回目)", symbol, attempt + 1,
+                           self.PLACE_ATTEMPTS)
+            self._cancel_all_orders_for_symbol(symbol)
+        return "lost", None, None
+
+    def _place_and_identify_once(self, symbol: str, is_buy: bool, price: float, size: float,
+                                  reduce_only: bool = False) -> tuple[str, Optional[int], Optional[dict]]:
         """指摘2(2026-07-22事故対応): 発注してcloidでoidを特定する。
         従来の`_find_oid_by_price`(symbol+side+価格文字列一致)はopenOrdersが返す
         limitPxの文字列表現がこちらの計算と食い違うと一致に失敗し、oid特定不能->約定検知
