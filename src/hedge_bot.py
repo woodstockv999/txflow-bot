@@ -104,6 +104,9 @@ class _Leg:
     close_resting_since: Optional[float] = None
     close_oid: Optional[int] = None
     close_requotes: int = 0
+    # 実際にclose発注したサイズ。reduce-onlyは実建玉基準で出すためtarget_sizeと一致しない
+    # (2026-07-23)。約定完了判定は「置いたサイズ」で行わないと閉じ残りを見逃す。
+    close_size: Optional[float] = None
 
     def notional(self, price: float) -> float:
         return abs(self.target_size) * price
@@ -174,6 +177,7 @@ class PairHedgeBot:
         self._abort_reason: Optional[str] = None
         self._lead_requote_streak = 0
         self._was_active_hours: Optional[bool] = None
+        self._last_placed_size: Optional[float] = None
 
     # ------------------------------------------------------------------ helpers
     def _within_active_hours(self, now: float) -> bool:
@@ -562,6 +566,7 @@ class PairHedgeBot:
                     self._abort_reason = "unwind_oid_lost_taker"
                 continue
             leg.close_oid = oid
+            leg.close_size = self._last_placed_size
             if status == "filled":
                 _apply_fill(leg, fill, "maker", closing=True)
         self.state = State.UNWIND
@@ -739,6 +744,7 @@ class PairHedgeBot:
                 leg.oid = new_oid
             else:
                 leg.close_oid = new_oid
+                leg.close_size = self._last_placed_size
             if st == "filled":
                 _apply_fill(leg, fill, "maker", closing=not is_open)
                 return "filled"
@@ -889,6 +895,7 @@ class PairHedgeBot:
             if not size or size <= 0:
                 logger.info("reduce-only発注をスキップ %s: 実建玉が既にゼロ", symbol)
                 return "lost", None, None  # 呼び出し元のtaker経路が「既にフラット」を検出して畳む
+        self._last_placed_size = size  # 呼び出し元が約定完了判定に使う実発注サイズ
 
         cloid = self.client.new_cloid()
         placed_at_ms = int(time.time() * 1000)
@@ -1115,7 +1122,8 @@ class PairHedgeBot:
         if leg.close_filled or leg.close_oid is None:
             return leg.close_filled
         fill = self._find_fill(leg.symbol, leg.close_oid)
-        if fill is None or fill["sz"] < leg.target_size * 0.999:
+        expected = leg.close_size if leg.close_size else leg.target_size
+        if fill is None or fill["sz"] < expected * 0.999:
             return False
         leg.close_price = fill["px"]
         leg.close_type = "maker"
