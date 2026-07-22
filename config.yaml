@@ -1,20 +1,18 @@
 # txflow-bot 設定
 # dry_run/enabled はどちらも安全側の既定値。実弾を出す変更は明示的な合意の上で行うこと。
 
-# 銘柄選定 2026-07-23(実測): 期待約定時間(板の厚み÷対向フロー)の悪い方が
-#   SOL 32,840秒 / ETH 5,740秒 に対し HBAR 431秒 / ARB 776秒。
-# SOL/ETHではmaker指値が板の厚みに埋もれ、約定は価格スイープ時のみ=逆選択だった。
-# 時間制約を受ける(リード脚が裸になる)ヘッジ側に最速のHBARを置く。
-base_symbol: ARB
-hedge_symbol: HBAR
+# 銘柄 2026-07-23: BTC/ETHへ回帰。価格を「タッチ内側1tick」に出す方式(_inside_price)に
+# したため、板が厚くても自分が新ベスト=キュー先頭で先客を飛ばして刺さる。厚い板=巨大フロー
+# の最前列に立てるので出来高スループットが桁違い(SOL/ETH時代 $8,000/時級)。
+# ※ARBはspread=1tickで内側の隙間が無く、この方式が効かないため不採用。BTC/ETH/SOLは
+#   spread=2tickで内側1tick出せる(実測確認済み)。
+base_symbol: BTC
+hedge_symbol: ETH
 notional_usd: 100
-hedge_ratio: 1.0        # ARB/HBARとも同程度のβ想定。実測βが出たら見直す
+hedge_ratio: 1.0        # BTC/ETH同notionalヘッジ。実測βが出たら見直す
 hold_seconds: 3.0
-# 30秒を実測(2026-07-23 06:12-06:33, 24サイクル)したが失敗。出来高$1,500→$2,468/時と
-# 増える一方 taker比が14%→57%に悪化し収支がマイナスへ。ARB/HBARの約定フローは2-2.7取引/分
-# しかなく、30秒では刺さる前に切れる(空振り22/24)。60秒に戻す。
 leg_timeout_seconds: 60
-max_requotes: 3         # timeout時、taker化の前にタッチへ置き直す回数
+max_requotes: 3         # timeout時、taker化の前にタッチ内側へ置き直す回数
 leverage: 3
 daily_loss_limit_usd: 5.0
 

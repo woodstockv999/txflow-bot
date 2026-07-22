@@ -183,6 +183,14 @@ class TxflowClient:
         q = round(price, decimals)
         return f"{q:.{decimals}f}" if decimals > 0 else f"{q:.0f}"
 
+    def price_decimals(self, symbol: str) -> int:
+        """価格の小数桁数(public)。tick=10^-decimals。"""
+        return self._price_decimals(symbol)
+
+    def price_tick(self, symbol: str) -> float:
+        """価格の最小刻み。l2Bookの価格文字列から動的推定した桁数の逆数。"""
+        return 10 ** -self._price_decimals(symbol)
+
     # ------------------------------------------------------------------ low-level HTTP
     def _post(self, path: str, body: dict) -> Any:
         url = f"{self.base_url}{path}"

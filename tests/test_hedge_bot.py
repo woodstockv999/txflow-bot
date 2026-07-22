@@ -43,6 +43,16 @@ class FakeClient:
     def quantize_size(self, symbol, size):
         return f"{size:.4f}"
 
+    def price_decimals(self, symbol):
+        bk = self.books.get(symbol.upper())
+        if bk and bk["levels"][0]:
+            px = str(bk["levels"][0][0]["px"])
+            return len(px.split(".")[1]) if "." in px else 0
+        return 2
+
+    def price_tick(self, symbol):
+        return 10 ** -self.price_decimals(symbol)
+
     def place_limit_order(self, symbol, is_buy, price, size, reduce_only=False, tif="post_only", cloid=None):
         oid = self._next_oid
         self._next_oid += 1
@@ -100,6 +110,20 @@ def _bot(cfg_overrides=None, client=None, ws=None, tmp_path="/tmp/hedge_bot_test
     bot = PairHedgeBot(cfg, client, ws, tmp_path, notify_fn=lambda *a, **k: notified.append(a))
     bot._notifications = notified
     return bot
+
+
+def _rest_placed_orders(bot, coin):
+    """置いた注文がopenOrdersにcloid付きで載る挙動をFakeClientに持たせる。"""
+    orig = bot.client.place_limit_order
+
+    def place_and_rest(symbol, is_buy, price, size, reduce_only=False, tif="post_only", cloid=None):
+        resp = orig(symbol, is_buy, price, size, reduce_only, tif, cloid)
+        if tif == bot.client.TIF_POST_ONLY:
+            bot.client.open_orders.append({"coin": coin, "oid": bot.client._next_oid - 1,
+                                            "cloid": cloid})
+        return resp
+
+    bot.client.place_limit_order = place_and_rest
 
 
 # ------------------------------------------------------------------ _apply_fill
@@ -398,3 +422,253 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ------------------------------------------------------------------ 2026-07-23: requote前置
+def test_hedge_leg_timeout_requotes_before_taker(monkeypatch):
+    """hedge脚のtimeoutは、max_requotesに達するまではtaker化せずタッチへ置き直す。"""
+    monkeypatch.setattr("src.hedge_bot.time.sleep", lambda *_: None)
+    bot = _bot(cfg_overrides={"leg_timeout_seconds": 10, "max_requotes": 2},
+               ws=FakeWS(books={"BTC": (65000.0, 65010.0), "ETH": (1900.0, 1900.5)}))
+    _rest_placed_orders(bot, "ETH-USDC")
+    bot.state = State.HEDGED
+    lead = _Leg(symbol="BTC", is_buy_open=True, target_size=0.001)
+    lead.open_price, lead.open_filled = 65000.0, True
+    hedge = _Leg(symbol="ETH", is_buy_open=False, target_size=0.03)
+    hedge.oid = 555
+    hedge.resting_price = 1900.0
+    hedge.resting_since = _time.time() - 100  # timeout済み
+    bot.legs = {"BTC": lead, "ETH": hedge}
+    bot.client.open_orders = [{"coin": "ETH-USDC", "oid": 555}]
+
+    bot._drive_hedged(_time.time())
+
+    # taker(IOC)ではなくpost_onlyで置き直されている
+    assert hedge.open_requotes == 1
+    assert hedge.open_filled is False
+    assert [o["tif"] for o in bot.client.placed] == [bot.client.TIF_POST_ONLY]
+    assert 555 in bot.client.canceled_oids
+    assert bot.state == State.HEDGED
+
+
+def test_hedge_leg_converts_to_taker_after_requote_budget_exhausted():
+    """max_requotesを使い切ったらtaker化する(従来動作へフォールバック)。"""
+    bot = _bot(cfg_overrides={"leg_timeout_seconds": 10, "max_requotes": 2},
+               ws=FakeWS(books={"BTC": (65000.0, 65010.0), "ETH": (1900.0, 1900.5)}))
+    bot.state = State.HEDGED
+    lead = _Leg(symbol="BTC", is_buy_open=True, target_size=0.001)
+    lead.open_price, lead.open_filled = 65000.0, True
+    hedge = _Leg(symbol="ETH", is_buy_open=False, target_size=0.03)
+    hedge.oid = 777
+    hedge.resting_price = 1900.0
+    hedge.resting_since = _time.time() - 100
+    hedge.open_requotes = 2  # 使い切り済み
+    bot.legs = {"BTC": lead, "ETH": hedge}
+    bot.client.open_orders = [{"coin": "ETH-USDC", "oid": 777}]
+
+    bot._drive_hedged(_time.time())
+
+    assert hedge.open_type == "taker"
+    assert bot._abort_reason == "hedge_leg_timeout_taker"
+    assert bot.client.placed[-1]["tif"] == bot.client.TIF_IOC
+
+
+def test_requote_treats_cancel_race_fill_as_maker_fill():
+    """置き直しの取消時に既に約定していたら、二重発注せずmaker約定として扱う。"""
+    bot = _bot(cfg_overrides={"leg_timeout_seconds": 10, "max_requotes": 2})
+    hedge = _Leg(symbol="ETH", is_buy_open=False, target_size=0.03)
+    hedge.oid = 888
+    hedge.resting_since = _time.time() - 100
+    bot.client.open_orders = []  # 取消後もopenOrdersに無い
+    bot.client.fills = [{"coin": "ETH", "oid": 888, "px": "1900.5", "sz": "0.03",
+                         "fee": "0.01", "side": "A", "time": int(_time.time() * 1000)}]
+
+    r = bot._requote_leg(hedge, 1900.0, 1900.5, "open", _time.time())
+
+    assert r == "filled"
+    assert hedge.open_type == "maker"
+    assert hedge.open_requotes == 0
+    assert bot.client.placed == []  # 置き直し発注をしていない
+
+
+# ------------------------------------------------------------------ 2026-07-23: 稼働時間ゲート
+def test_active_hours_gate_blocks_new_cycle_but_not_inflight():
+    bot = _bot(cfg_overrides={"active_hours": {"start_hour": 3, "end_hour": 24}})
+    h3 = _time.mktime(_time.localtime()[:3] + (3, 30, 0) + _time.localtime()[6:])
+    h1 = _time.mktime(_time.localtime()[:3] + (1, 30, 0) + _time.localtime()[6:])
+    assert bot._within_active_hours(h3) is True
+    assert bot._within_active_hours(h1) is False
+
+    # 時間外のIDLEでは新規サイクルを開始しない
+    bot.state = State.IDLE
+    bot._tick_inner(h1)
+    assert bot.client.placed == []
+    assert bot.state == State.IDLE
+
+
+def test_active_hours_absent_means_always_on():
+    bot = _bot()
+    assert bot._within_active_hours(_time.time()) is True
+
+
+# ------------------------------------------------------------------ 2026-07-23: 内側1tick
+def test_inside_price_places_one_tick_inside_touch():
+    """スプレッド2tick以上なら、買いはbid+tick・売りはask-tickに置いて自分が新ベストになる。"""
+    bot = _bot()
+    bot.client.books["HBAR"] = {"levels": [[{"px": "0.07151"}], [{"px": "0.07153"}]]}
+    assert bot._inside_price("HBAR", True, 0.07151) == 0.07152   # bid+tick
+    assert bot._inside_price("HBAR", False, 0.07153) == 0.07152  # ask-tick
+
+
+def test_inside_price_falls_back_to_touch_when_spread_one_tick():
+    """spread=1tick(内側の隙間なし)ならタッチにそのまま置く(クロス防止)。"""
+    bot = _bot()
+    bot.client.books["ARB"] = {"levels": [[{"px": "0.0906"}], [{"px": "0.0907"}]]}
+    assert bot._inside_price("ARB", True, 0.0906) == 0.0906    # bid+tickがask以上→bid
+    assert bot._inside_price("ARB", False, 0.0907) == 0.0907   # ask-tickがbid以下→ask
+
+
+def test_inside_price_falls_back_to_touch_when_book_unavailable():
+    bot = _bot()  # FakeClientの既定は空板
+    assert bot._inside_price("HBAR", True, 0.0715) == 0.0715
+
+
+# ------------------------------------------------------------------ 2026-07-23: reduce-onlyサイズ
+def test_clamp_size_to_position_limits_reduce_only_size():
+    """reduce-onlyのサイズは常に実建玉。target_sizeは取消×約定レースの取りこぼしで
+    実建玉と乖離するため信用しない。"""
+    bot = _bot()
+    bot.client.clearinghouse_state = {"assetPositions": [{"position": {"coin": "ARB-USDC", "szi": "46.0"}}]}
+    assert bot._clamp_size_to_position("ARB", 307.0) == 46.0
+    # 建玉の方が大きい場合も実建玉を採用する(閉じ残り=stranded legを作らない)
+    assert bot._clamp_size_to_position("ARB", 20.0) == 46.0
+    # 建玉なし -> 0(呼び出し元が発注をスキップする)
+    assert bot._clamp_size_to_position("HBAR", 100.0) == 0.0
+
+
+def test_taker_close_skips_order_when_already_flat():
+    """既にフラットなら、拒否される注文を出さずにclose済みとして扱う。"""
+    bot = _bot()
+    bot.client.clearinghouse_state = {"assetPositions": []}
+    leg = _Leg(symbol="ARB", is_buy_open=True, target_size=307.0)
+    leg.open_price, leg.open_filled = 0.09, True
+
+    bot._convert_leg_to_taker(leg, 0.0903, 0.0905, phase="close")
+
+    assert leg.close_filled is True
+    assert bot.client.placed == []  # 発注していない
+
+
+def test_taker_close_uses_actual_position_size():
+    bot = _bot()
+    bot.client.clearinghouse_state = {"assetPositions": [{"position": {"coin": "ARB-USDC", "szi": "46.0"}}]}
+    leg = _Leg(symbol="ARB", is_buy_open=True, target_size=307.0)
+    leg.open_price, leg.open_filled = 0.09, True
+
+    bot._convert_leg_to_taker(leg, 0.0903, 0.0905, phase="close")
+
+    assert bot.client.placed[-1]["size"] == 46.0  # target 307 でなく実建玉 46
+    assert bot.client.placed[-1]["reduce_only"] is True
+
+
+def test_place_and_identify_retries_once_when_order_vanishes(monkeypatch):
+    """post_onlyがstatus okのまま消えた場合、takerに落とす前に一度置き直す。"""
+    monkeypatch.setattr("src.hedge_bot.time.sleep", lambda *_: None)
+    bot = _bot()
+    calls = []
+
+    def fake_once(symbol, is_buy, price, size, reduce_only=False):
+        calls.append(symbol)
+        if len(calls) == 1:
+            return "lost", None, None
+        return "resting", 4242, None
+
+    bot._place_and_identify_once = fake_once
+    status, oid, _ = bot._place_and_identify("HBAR", True, 0.0715, 1400)
+
+    assert (status, oid) == ("resting", 4242)
+    assert len(calls) == 2
+
+
+def test_place_and_identify_gives_up_after_attempt_budget(monkeypatch):
+    monkeypatch.setattr("src.hedge_bot.time.sleep", lambda *_: None)
+    bot = _bot()
+    calls = []
+    bot._place_and_identify_once = lambda *a, **k: (calls.append(1), ("lost", None, None))[1]
+
+    status, _, _ = bot._place_and_identify("HBAR", True, 0.0715, 1400)
+
+    assert status == "lost"
+    assert len(calls) == bot.PLACE_ATTEMPTS
+
+
+def test_close_fill_completion_uses_actual_placed_size_not_target():
+    """reduce-onlyは実建玉基準で発注するためtarget_sizeより大きくなりうる。
+    完了判定をtarget_sizeで行うと閉じ残りをclose済みと誤判定しstranded legになる。"""
+    bot = _bot()
+    leg = _Leg(symbol="ARB", is_buy_open=True, target_size=186.0)
+    leg.close_oid = 900
+    leg.close_size = 1030.0  # 実建玉基準で置いたサイズ
+    bot.client.fills = [{"oid": 900, "px": "0.0904", "sz": "186", "fee": "0.001"}]
+    # target_size(186)は満たすが、実際に置いた1030には全く足りない -> 未完了
+    assert bot._check_live_fill_close(leg) is False
+    bot.client.fills.append({"oid": 900, "px": "0.0904", "sz": "844", "fee": "0.004"})
+    assert bot._check_live_fill_close(leg) is True   # 合計1030で完了
+
+
+def test_close_size_recorded_from_actual_placement():
+    bot = _bot(ws=FakeWS(books={"ARB": (0.0903, 0.0905), "HBAR": (0.0715, 0.0716)}))
+    _rest_placed_orders(bot, "ARB-USDC")
+    bot.client.clearinghouse_state = {"assetPositions": [
+        {"position": {"coin": "ARB-USDC", "szi": "1030.0"}}]}
+    bot.client.books["ARB"] = {"levels": [[{"px": "0.0903"}], [{"px": "0.0905"}]]}
+    leg = _Leg(symbol="ARB", is_buy_open=True, target_size=186.0)
+    leg.open_price, leg.open_filled = 0.09, True
+    bot.legs = {"ARB": leg}
+    bot.state = State.HOLD
+
+    bot._start_unwind(_time.time())
+
+    assert leg.close_size == 1030.0  # target 186 でなく実建玉
+
+
+def test_unwind_reopens_close_when_position_still_remains():
+    """取消×約定レースで部分約定を掴んでclose_filledが立っても、実建玉が残っていれば
+    未完了に巻き戻して残量を閉じ直す(stranded legをサイクル外にこぼさない)。"""
+    bot = _bot(ws=FakeWS(books={"ARB": (0.0903, 0.0905)}))
+    leg = _Leg(symbol="ARB", is_buy_open=True, target_size=1106.0)
+    leg.open_price, leg.open_filled = 0.09, True
+    leg.close_filled = True          # 313だけ約定して完了扱いになった状態
+    leg.close_price, leg.close_fee, leg.close_type = 0.0904, 0.001, "maker"
+    leg.close_oid, leg.close_size = 700, 1106.0
+    bot.client.clearinghouse_state = {"assetPositions": [
+        {"position": {"coin": "ARB-USDC", "szi": "793.0"}}]}   # 残り793
+
+    bot.client.open_orders = [{"coin": "ARB-USDC", "oid": 700}]
+
+    assert bot._verify_leg_flat(leg, _time.time()) is False
+    assert leg.close_filled is False   # 巻き戻っている
+    assert leg.close_oid is None
+    assert leg.close_size is None
+    assert 700 in bot.client.canceled_oids  # 板の残注文を孤児にしない
+
+
+def test_unwind_flat_verification_passes_when_position_zero():
+    bot = _bot()
+    leg = _Leg(symbol="ARB", is_buy_open=True, target_size=1106.0)
+    leg.close_filled = True
+    bot.client.clearinghouse_state = {"assetPositions": []}
+    assert bot._verify_leg_flat(leg, _time.time()) is True
+    assert leg.close_filled is True
+
+
+def test_verify_leg_flat_ignores_dust_residual():
+    """微小残(notional < DUST_USD)は閉じ直さず完了扱いにする。"""
+    bot = _bot(ws=FakeWS(books={"ARB": (0.09, 0.0902)}))
+    leg = _Leg(symbol="ARB", is_buy_open=True, target_size=1106.0)
+    leg.close_filled = True
+    bot.client.clearinghouse_state = {"assetPositions": [
+        {"position": {"coin": "ARB-USDC", "szi": "-7.0"}}]}  # 7*0.0901 ≒ $0.63 < 5
+    assert bot._verify_leg_flat(leg, _time.time()) is True
+    assert leg.close_filled is True
+    assert bot.client.canceled_oids == []  # 掃除も走らない

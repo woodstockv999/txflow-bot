@@ -917,11 +917,10 @@ class PairHedgeBot:
           ("lost", None, None)    — どちらでも同定できず。呼び出し元は該当symbolの全open order
                                      取消(`_cancel_all_orders_for_symbol`)とcycle中断が必須。
         """
-        # 2026-07-23: post_onlyがstatus okのまま消える事象の対策。呼び出し元が渡す価格は
-        # WS板由来で数百msの遅れがあり、ARB/HBARのような薄く速い板では発注がエンジンに
-        # 届く頃にクロス側へ回りpost_onlyが(非同期に)棄却される。発注直前にRESTで板を
-        # 取り直し、絶対にクロスしない価格へクランプする(=常に最新のタッチにjoinする)。
-        price = self._clamp_price_to_passive(symbol, is_buy, price)
+        # 2026-07-23: 発注直前にRESTで板を取り直し、タッチ内側1tickに置く(自分が新ベスト=
+        # キュー先頭)。WS板由来の古い価格でpost_onlyがクロス棄却される事象も同時に潰れる
+        # (内側1tickは必ず bid<p<ask に収まるため)。
+        price = self._inside_price(symbol, is_buy, price)
 
         if reduce_only:
             size = self._clamp_size_to_position(symbol, size)
@@ -1013,22 +1012,33 @@ class PairHedgeBot:
             return size
         return abs(szi)
 
-    def _clamp_price_to_passive(self, symbol: str, is_buy: bool, price: float) -> float:
-        """post_onlyがクロスして棄却されないよう、直近のRESTの板で価格をパッシブ側へ寄せる。
-        買いは現在のbid以下、売りは現在のask以上に必ず収める。板が取れなければ元の価格を返す
-        (安全側=従来動作)。"""
+    def _inside_price(self, symbol: str, is_buy: bool, fallback: float) -> float:
+        """タッチ内側1tickに出す(2026-07-23、perplはタッチjoinだったのに対する改良)。
+
+        キューは先着順なので、タッチ(bid/ask)にjoinすると板トップの先客($40万規模)の後ろに
+        並び、厚いBTC/ETH板では順番が来ない。内側1tick(買いはbid+tick・売りはask-tick)に
+        出すと自分が新ベスト=キュー先頭になり、先客を飛ばして最初に約定する。実測(2026-07-23
+        BTC/ETH/SOL)で棄却されず板に乗り、自分がベストになることを確認済み。
+        bid<p<ask に収めるためpost_onlyはクロスしない。スプレッドが1tickで内側の隙間が無い
+        (ARB等)場合と板が取れない場合はタッチ(fallback)にそのまま置く。"""
         try:
             lv = self.client.get_l2book(symbol)["levels"]
             bid = float(lv[0][0]["px"])
             ask = float(lv[1][0]["px"])
         except Exception as e:
-            logger.warning("発注前の板再取得に失敗 %s(クランプ省略): %s", symbol, e)
-            return price
-        clamped = min(price, bid) if is_buy else max(price, ask)
-        if clamped != price:
-            logger.info("発注価格をクランプ %s is_buy=%s %.8f -> %.8f (bid=%s ask=%s)",
-                        symbol, is_buy, price, clamped, bid, ask)
-        return clamped
+            logger.warning("発注前の板再取得に失敗 %s(内側化省略): %s", symbol, e)
+            return fallback
+        dec = self.client.price_decimals(symbol)
+        tick = self.client.price_tick(symbol)
+        if is_buy:
+            p = round(bid + tick, dec)
+            if p >= ask:   # スプレッド1tick=内側の隙間なし
+                p = bid
+        else:
+            p = round(ask - tick, dec)
+            if p <= bid:
+                p = ask
+        return p
 
     def _cancel_all_orders_for_symbol(self, symbol: str) -> None:
         """指摘2/3: oid特定不能時・起動時リコンサイルで使う、symbol指定の全open order取消。"""
