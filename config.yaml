@@ -12,6 +12,10 @@ base_symbol: ARB
 hedge_symbol: HBAR
 notional_usd: 100
 hedge_ratio: 1.0
+# 起動/watchdogリコンサイルの全建玉フラット化から除外する銘柄(2026-07-23)。
+# txflow×perplクロス会場ヘッジ検証で、このbot管理外のBTC建玉を同一口座に意図的に持つため。
+# ★このbotがBTCをtradeする設定にする時は必ず外すこと(保護中はBTCの孤児掃除が効かない/直接衝突する)。
+reconcile_protect_symbols: ["BTC"]
 hold_seconds: 3.0
 leg_timeout_seconds: 60
 max_requotes: 3

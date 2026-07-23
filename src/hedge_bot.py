@@ -289,6 +289,7 @@ class PairHedgeBot:
 
     def _watchdog_force_reset(self, now: float) -> None:
         if not self.cfg.get("dry_run", True):
+            protected = {str(s).split("-")[0].upper() for s in self.cfg.get("reconcile_protect_symbols", [])}
             for symbol in (self.cfg["base_symbol"], self.cfg["hedge_symbol"]):
                 self._cancel_all_orders_for_symbol(symbol)
             for attempt in range(2):
@@ -298,7 +299,8 @@ class PairHedgeBot:
                     logger.error("watchdog: clearinghouseState取得失敗(attempt %d/2): %s", attempt + 1, e)
                     continue
                 positions = [p["position"] for p in chs.get("assetPositions", [])
-                             if abs(float(p["position"].get("szi", 0))) > 1e-12]
+                             if abs(float(p["position"].get("szi", 0))) > 1e-12
+                             and str(p["position"].get("coin", "")).split("-")[0].upper() not in protected]
                 if not positions:
                     break
                 for pos in positions:
@@ -1107,20 +1109,30 @@ class PairHedgeBot:
         事故: BTCからSOLへconfig切替して再起動した際、botが見ていないBTC建玉0.0030が
         裸で残った(手動決済済み)。configで見えるsymbolだけを見る`_reconcile_stranded_legs`
         (毎IDLE tick、稼働中の軽量チェック用)だけでは再発を防げないため、起動時は
-        symbol不問の全件スイープを別途行う。dry_runでは何もしない。"""
+        symbol不問の全件スイープを別途行う。dry_runでは何もしない。
+
+        例外: `reconcile_protect_symbols`(config、既定[])に挙げた銘柄は取消/フラット化の
+        対象外にする。別会場ヘッジ等で、このbot管理外の建玉を同一口座に意図的に持つケース
+        (2026-07-23 txflow×perplクロス会場ヘッジ検証)で、起動リコンサイルに畳まれるのを防ぐ。
+        ※保護した銘柄はこのbotが自分で掃除しないので、そのbotがその銘柄をtradeしない前提で使う。"""
         if self.cfg.get("dry_run", True):
             return
+
+        protected = {str(s).split("-")[0].upper() for s in self.cfg.get("reconcile_protect_symbols", [])}
 
         try:
             open_orders = self.client.get_open_orders()
         except Exception as e:
             logger.error("startup_reconcile: openOrders取得失敗: %s", e)
             open_orders = []
+        open_orders = [o for o in (open_orders or [])
+                       if str(o.get("coin", "")).split("-")[0].upper() not in protected]
         if open_orders:
-            logger.warning("startup_reconcile: 起動時にopen order %d件を検出 -> 全取消", len(open_orders))
+            logger.warning("startup_reconcile: 起動時にopen order %d件を検出 -> 全取消(保護=%s)",
+                            len(open_orders), sorted(protected) or "なし")
             self._notify("startup_reconcile", "orange",
                           f"txflow-bot起動: open order {len(open_orders)}件を検出、全取消します")
-        for o in open_orders or []:
+        for o in open_orders:
             coin = str(o.get("coin", "")).split("-")[0].upper()
             try:
                 self.client.cancel_order(coin, o.get("oid"))
@@ -1133,7 +1145,8 @@ class PairHedgeBot:
             logger.error("startup_reconcile: clearinghouseState取得失敗: %s", e)
             return
         positions = [p["position"] for p in chs.get("assetPositions", [])
-                     if abs(float(p["position"].get("szi", 0))) > 1e-12]
+                     if abs(float(p["position"].get("szi", 0))) > 1e-12
+                     and str(p["position"].get("coin", "")).split("-")[0].upper() not in protected]
         if positions:
             symbols = [p["coin"] for p in positions]
             logger.warning("startup_reconcile: 起動時に建玉%d件を検出(%s) -> reduce-only IOCでフラット化",
