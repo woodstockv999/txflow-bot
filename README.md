@@ -216,3 +216,24 @@ python3 scripts/cloid_probe.py
 - **日次損失窓(`daily_loss_limit_usd`)はプロセス内メモリで保持しており、プロセス再起動で
   リセットされる**(永続化していない)。v1として許容(pm2再起動が頻発する運用だと損失上限が
   実効的に緩む点は把握しておくこと)。
+
+## 退役: perpl_xhedge_tape (2026-07-25)
+
+`scripts/perpl_xhedge_tape.py` の pm2 常駐(`txflow-xhedge-tape`)と、2時間毎レポート cron
+(`scripts/xhedge_report.sh`)を**退役**した。スクリプト自体は残置(復活可能)。
+
+- **退役理由**: テープの目的は「実弾投入前のオフライン経済性検証」で、xvenue-hedge が
+  219サイクル実稼働した時点で `~/apps/xvenue-hedge/data/cycles.jsonl` が上位の実測データに
+  なった。加えてテープは perpl `GET /v1/pub/context` を**1秒間隔**で叩くが、これは xvenue が
+  `perpl_bbo_ttl_seconds: 2.0` の短TTLキャッシュで意図的に削った負荷そのもので、同一IPで
+  live bot と CF レート制限(1015)を食い合う。
+- **実際は 2026-07-24 00:00 に SIGINT で停止しており、以後2日間データは増えていなかった**。
+  にもかかわらず `xhedge_report.sh` は staleness チェックを持たず、**固まったテープの上で
+  同じ内容を2時間毎に Discord へ送り続けていた**(通知が来ている=生きている、が成り立たない
+  典型例)。レポートを常駐データに依存させるなら必ず更新時刻のガードを入れること。
+- **データ退避先**: `gdrive:vps-hifreq-data/perpl_xhedge_tape_20260723.jsonl.gz`
+  (2.0MB→147KB。`data/*.jsonl` は .gitignore 対象=git には入っていないため Drive が唯一の正)。
+- **復活手順**(ecosystem.config.js に登録が無かったため手動):
+  `pm2 start scripts/perpl_xhedge_tape.py --name txflow-xhedge-tape --interpreter .venv/bin/python3`
+  (cwd=`/home/w00dst0ck/apps/txflow-bot`)。復活させるならポーリング間隔を 1s→5s に落として
+  live bot との 429 競合を避ける。

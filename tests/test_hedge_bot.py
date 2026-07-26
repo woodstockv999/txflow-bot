@@ -672,3 +672,16 @@ def test_verify_leg_flat_ignores_dust_residual():
     assert bot._verify_leg_flat(leg, _time.time()) is True
     assert leg.close_filled is True
     assert bot.client.canceled_oids == []  # 掃除も走らない
+
+
+def test_touch_price_stays_passive_on_the_touch():
+    """pricing_mode=touch: 買いはbid以下・売りはask以上(クロスしない)。"""
+    bot = _bot(cfg_overrides={"pricing_mode": "touch"})
+    bot.client.books["HBAR"] = {"levels": [[{"px": "0.07151"}], [{"px": "0.07153"}]]}
+    assert bot._touch_price("HBAR", True, 0.07151) == 0.07151    # bidそのまま
+    assert bot._touch_price("HBAR", False, 0.07153) == 0.07153   # askそのまま
+    assert bot._touch_price("HBAR", True, 0.07160) == 0.07151    # bidより上→bidへ
+    # pricing_modeでの分岐
+    assert bot._price_for_place("HBAR", True, 0.07151) == 0.07151
+    bot.cfg["pricing_mode"] = "inside"
+    assert bot._price_for_place("HBAR", True, 0.07151) == 0.07152  # 内側1tick
