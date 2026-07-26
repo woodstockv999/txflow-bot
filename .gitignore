@@ -1,8 +1,17 @@
 .env
-.env.local
+# `.env.local` の個別指定だけでは .env.bak 等が追跡可能だった(2026-07-26 監査)。
+.env.*
+!.env.example
+*.bak
+*.save
+*~
+*.db
 __pycache__/
 *.pyc
 .venv/
 data/*.jsonl
+# data/*.json も除外する(data/keys.json 等を置いた瞬間に public へ載る穴)。
+# 既に追跡済みの data/instruments.json は公開データなので影響を受けない。
+data/*.json
 data/*.log
 *.log
