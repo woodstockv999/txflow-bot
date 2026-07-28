@@ -1,0 +1,76 @@
+# txflow デイトレbot 設定 (閉場ドリフト継続戦略)
+#
+# 根拠: ~/hlbot-research/txflow-daytrade-20260729/report.md
+#   x = 前引け(20:00 UTC) → 当寄り(13:30 UTC) の perp ドリフト
+#   y = 当寄り → 当引け。x の符号方向に寄りで建て、引けで decay。
+#   FMB傾き 0.091 → 損益分岐は |x| ≈ コスト/0.09 ≈ 120bps。
+#
+# ★このエッジは統計的に未確定(どの検定も平均<MDE、n=72日が上限)。
+#   小額の前進検証が目的であって、確定した戦略の運用ではない。
+
+# 2026-07-29: 前進検証のため実弾へ(ユーザー合意済み)。エッジは未確定なので小額固定。
+dry_run: false
+enabled: true
+
+# --- サイズ
+notional_usd: 100.0
+max_leverage: 2.0      # notional_usd <= accountValue * max_leverage を強制
+
+# --- シグナル/銘柄フィルタ
+min_abs_x_bps: 150.0   # 損益分岐120bps + 余裕。これ未満の日は建てない
+min_depth10bps_usd: 3000.0   # ±10bps 厚み。$100建玉が板を壊さない水準
+# 3倍レバETF/VIX系は構造的に常に |x| 最大になり実効サンプル数を食い潰すため除外
+# (バックテストで生|x|上位1を取ると SOXL が 62日中21日を占めた)
+exclude_symbols: ["SOXL", "UVXY"]
+candidates:
+  - TSLA
+  - NVDA
+  - AAPL
+  - MSFT
+  - AMD
+  - MU
+  - COIN
+  - MSTR
+  - SPY
+  - QQQ
+  - GOOGL
+  - META
+  - AMZN
+  - TSM
+  - SNDK
+  - AVGO
+  - ARM
+  - MRVL
+  - QCOM
+  - HOOD
+  - PLTR
+  - CRCL
+  - CRWV
+  - LITE
+  - LRCX
+  - INTC
+  - URNM
+  - EWJ
+  - PAYP
+  - CC
+  - STXX
+  - NIGHT
+  - GRAM
+  - SPCX
+
+# --- 執行
+entry_slippage_bps: 15.0     # marketable IOC の許容スリッページ(mid基準)
+exit_slippage_bps: 25.0      # 決済は確実性優先で広め
+exit_max_attempts: 6
+entry_window_minutes: 5      # 寄りから何分以内なら建てにいくか(再起動時の取りこぼし対策)
+exit_grace_minutes: 10       # 引け後この分数までに必ずフラットにする
+
+# --- ガード
+daily_loss_limit_usd: 5.0
+# 米国市場の休場日(取引しない)。半日立会いの日もここに入れて見送る。
+holidays:
+  - "2026-09-07"   # Labor Day
+  - "2026-11-26"   # Thanksgiving
+  - "2026-11-27"   # 半日立会い
+  - "2026-12-24"   # 半日立会い
+  - "2026-12-25"   # Christmas
