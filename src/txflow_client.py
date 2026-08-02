@@ -106,7 +106,13 @@ class TxflowClient:
         main_address: Optional[str] = None,
         base_url: str = BASE_URL,
         timeout: float = 10.0,
-        max_retries: int = 5,
+        # B15(2026-08-02): この同期バックオフは呼び出し元プロセスのスレッドをそのまま眠らせる。
+        # hyperliquid-bot ではAPSchedulerが単一ワーカースレッド(APSThreadPoolExecutor(1))のため、
+        # ここで眠るとpoll_price/check_stop等の全ジョブがそのぶん丸ごと止まる(実測: 7.5hで
+        # 238ジョブスキップ・79%が429発生20秒以内と相関)。旧値(max_retries=5、delay上限30秒)は
+        # 最悪 1+2+4+8+16=31秒 の連続スリープになりえた。3回・delay上限2秒(1+2+2=5秒)に縮小し、
+        # 429/5xx/一時障害への耐性(リトライ自体・枯渇時の例外送出)は維持する。
+        max_retries: int = 3,
         network: Optional[dict] = None,
     ):
         self.base_url = base_url.rstrip("/")
@@ -194,6 +200,8 @@ class TxflowClient:
     # ------------------------------------------------------------------ low-level HTTP
     def _post(self, path: str, body: dict) -> Any:
         url = f"{self.base_url}{path}"
+        # B15: delay上限を2秒に抑える(__init__のmax_retriesコメント参照)。3回リトライで
+        # 最悪 1+2+2=5秒 に収める(呼び出し元の単一スケジューラスレッドを長時間眠らせない)。
         delay = 1.0
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
@@ -203,7 +211,7 @@ class TxflowClient:
                 last_exc = e
                 logger.warning("txflow POST %s failed (attempt %d/%d): %s", path, attempt, self.max_retries, e)
                 time.sleep(delay)
-                delay = min(delay * 2, 30.0)
+                delay = min(delay * 2, 2.0)
                 continue
 
             ctype = resp.headers.get("content-type", "")
@@ -214,14 +222,14 @@ class TxflowClient:
                 if resp.status_code == 403 or "cloudflare" in resp.text.lower():
                     logger.warning("txflow POST %s: Cloudflareブロック疑い、リトライ (attempt %d/%d)", path, attempt, self.max_retries)
                 time.sleep(delay)
-                delay = min(delay * 2, 30.0)
+                delay = min(delay * 2, 2.0)
                 continue
 
             if resp.status_code == 429 or resp.status_code >= 500:
                 last_exc = TxflowApiError(f"{path}: HTTP {resp.status_code}", resp.status_code, resp.text[:500])
                 logger.warning("txflow POST %s: %s, リトライ (attempt %d/%d)", path, last_exc, attempt, self.max_retries)
                 time.sleep(delay)
-                delay = min(delay * 2, 30.0)
+                delay = min(delay * 2, 2.0)
                 continue
 
             if resp.status_code >= 400:
